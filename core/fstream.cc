@@ -27,27 +27,190 @@
 #include <malloc.h>
 #include <string.h>
 
+namespace seastar {
+
 class file_data_source_impl : public data_source_impl {
+    struct issued_read {
+        uint64_t _pos;
+        uint64_t _size;
+        future<temporary_buffer<char>> _ready;
+
+        issued_read(uint64_t pos, uint64_t size, future<temporary_buffer<char>> f)
+            : _pos(pos), _size(size), _ready(std::move(f)) { }
+    };
+
+    reactor& _reactor = engine();
     file _file;
     file_input_stream_options _options;
     uint64_t _pos;
     uint64_t _remain;
-    circular_buffer<future<temporary_buffer<char>>> _read_buffers;
+    circular_buffer<issued_read> _read_buffers;
     unsigned _reads_in_progress = 0;
+    unsigned _current_read_ahead;
+    future<> _dropped_reads = make_ready_future<>();
     std::experimental::optional<promise<>> _done;
+    size_t _current_buffer_size;
+    bool _in_slow_start = false;
+    using unused_ratio_target = std::ratio<25, 100>;
+private:
+    size_t minimal_buffer_size() const {
+        return std::min(std::max(_options.buffer_size / 4, size_t(8192)), _options.buffer_size);
+    }
+
+    void try_increase_read_ahead() {
+        // Read-ahead can be increased up to user-specified limit if the
+        // consumer has to wait for a buffer and we are not in a slow start
+        // phase.
+        if (_current_read_ahead < _options.read_ahead && !_in_slow_start) {
+            _current_read_ahead++;
+            if (_options.dynamic_adjustments) {
+                auto& h = *_options.dynamic_adjustments;
+                h.read_ahead = std::max(h.read_ahead, _current_read_ahead);
+            }
+        }
+    }
+    unsigned get_initial_read_ahead() const {
+        return _options.dynamic_adjustments
+               ? std::min(_options.dynamic_adjustments->read_ahead, _options.read_ahead)
+               : !!_options.read_ahead;
+    }
+
+    void update_history(uint64_t unused, uint64_t total) {
+        // We are maintaining two windows each no larger than window_size.
+        // Dynamic adjustment logic uses data from both of them, which
+        // essentially means that the actual window size is variable and
+        // in the range [window_size, 2*window_size].
+        auto& h = *_options.dynamic_adjustments;
+        h.current_window.total_read += total;
+        h.current_window.unused_read += unused;
+        if (h.current_window.total_read >= h.window_size) {
+            h.previous_window = h.current_window;
+            h.current_window = { };
+        }
+    }
+    static bool below_target(uint64_t unused, uint64_t total) {
+        return unused * unused_ratio_target::den < total * unused_ratio_target::num;
+    }
+    void update_history_consumed(uint64_t bytes) {
+        if (!_options.dynamic_adjustments) {
+            return;
+        }
+        update_history(0, bytes);
+        if (!_in_slow_start) {
+            return;
+        }
+        unsigned new_size = std::min(_current_buffer_size * 2, _options.buffer_size);
+        auto& h = *_options.dynamic_adjustments;
+        auto total = h.current_window.total_read + h.previous_window.total_read + new_size;
+        auto unused = h.current_window.unused_read + h.previous_window.unused_read + new_size;
+        // Check whether we can safely increase the buffer size to new_size
+        // and still be below unused_ratio_target even if it is entirely
+        // dropped.
+        if (below_target(unused, total)) {
+            _current_buffer_size = new_size;
+            _in_slow_start = _current_buffer_size < _options.buffer_size;
+        }
+    }
+
+    using after_skip = bool_class<class after_skip_tag>;
+    void set_new_buffer_size(after_skip skip) {
+        if (!_options.dynamic_adjustments) {
+            return;
+        }
+        auto& h = *_options.dynamic_adjustments;
+        int64_t total = h.current_window.total_read + h.previous_window.total_read;
+        int64_t unused = h.current_window.unused_read + h.previous_window.unused_read;
+        if (skip == after_skip::yes && below_target(unused, total)) {
+            // Do not attempt to shrink buffer size if we are still below the
+            // target. Otherwise, we could get a bad interaction with
+            // update_history_consumed() which tries to increase the buffer
+            // size as much as possible so that after a single drop we are
+            // still below the target.
+            return;
+        }
+        // Calculate the maximum buffer size that would guarantee that we are
+        // still below unused_ratio_target even if the subsequent reads are
+        // dropped. If it is larger than or equal to the current buffer size do
+        // nothing. If it is smaller then we are back in the slow start phase.
+        auto new_target = (unused_ratio_target::num * total - unused_ratio_target::den * unused) / (unused_ratio_target::den - unused_ratio_target::num);
+        uint64_t new_size = std::max(new_target, int64_t(minimal_buffer_size()));
+        new_size = std::max(uint64_t(1) << log2floor(new_size), uint64_t(minimal_buffer_size()));
+        if (new_size >= _current_buffer_size) {
+            return;
+        }
+        _in_slow_start = true;
+        _current_read_ahead = std::min(_current_read_ahead, 1u);
+        _current_buffer_size = new_size;
+    }
+    void update_history_unused(uint64_t bytes) {
+        if (!_options.dynamic_adjustments) {
+            return;
+        }
+        update_history(bytes, bytes);
+        set_new_buffer_size(after_skip::yes);
+    }
+    // Safely ignores read future even if it is not resolved yet.
+    void ignore_read_future(future<temporary_buffer<char>> read_future) {
+        if (read_future.available()) {
+            read_future.ignore_ready_future();
+            return;
+        }
+        auto f = read_future.then_wrapped([] (auto f) { f.ignore_ready_future(); });
+        _dropped_reads = _dropped_reads.then([f = std::move(f)] () mutable { return std::move(f); });
+    }
 public:
     file_data_source_impl(file f, uint64_t offset, uint64_t len, file_input_stream_options options)
-            : _file(std::move(f)), _options(options), _pos(offset), _remain(len) {
+            : _file(std::move(f)), _options(options), _pos(offset), _remain(len), _current_read_ahead(get_initial_read_ahead())
+            , _current_buffer_size(_options.buffer_size) {
         // prevent wraparounds
+        set_new_buffer_size(after_skip::no);
         _remain = std::min(std::numeric_limits<uint64_t>::max() - _pos, _remain);
     }
     virtual future<temporary_buffer<char>> get() override {
-        if (_read_buffers.empty()) {
-            issue_read_aheads(1);
+        if (!_read_buffers.empty() && !_read_buffers.front()._ready.available()) {
+            try_increase_read_ahead();
         }
+        issue_read_aheads(1);
         auto ret = std::move(_read_buffers.front());
         _read_buffers.pop_front();
-        return ret;
+        update_history_consumed(ret._size);
+        _reactor._io_stats.fstream_reads += 1;
+        _reactor._io_stats.fstream_read_bytes += ret._size;
+        if (!ret._ready.available()) {
+            _reactor._io_stats.fstream_reads_blocked += 1;
+            _reactor._io_stats.fstream_read_bytes_blocked += ret._size;
+        }
+        return std::move(ret._ready);
+    }
+    virtual future<temporary_buffer<char>> skip(uint64_t n) override {
+        uint64_t dropped = 0;
+        while (n) {
+            if (_read_buffers.empty()) {
+                assert(n <= _remain);
+                _pos += n;
+                _remain -= n;
+                break;
+            }
+            auto& front = _read_buffers.front();
+            if (n < front._size) {
+                front._size -= n;
+                front._pos += n;
+                front._ready = front._ready.then([n] (temporary_buffer<char> buf) {
+                    buf.trim_front(n);
+                    return buf;
+                });
+                break;
+            } else {
+                ignore_read_future(std::move(front._ready));
+                n -= front._size;
+                dropped += front._size;
+                _reactor._io_stats.fstream_read_aheads_discarded += 1;
+                _reactor._io_stats.fstream_read_ahead_discarded_bytes += front._size;
+                _read_buffers.pop_front();
+            }
+        }
+        update_history_unused(dropped);
+        return make_ready_future<temporary_buffer<char>>();
     }
     virtual future<> close() {
         _done.emplace();
@@ -55,24 +218,30 @@ public:
             _done->set_value();
         }
         return _done->get_future().then([this] {
+            uint64_t dropped = 0;
             for (auto&& c : _read_buffers) {
-                c.ignore_ready_future();
+                _reactor._io_stats.fstream_read_aheads_discarded += 1;
+                _reactor._io_stats.fstream_read_ahead_discarded_bytes += c._size;
+                dropped += c._size;
+                ignore_read_future(std::move(c._ready));
             }
+            update_history_unused(dropped);
+            return std::move(_dropped_reads);
         });
     }
 private:
-    void issue_read_aheads(unsigned min_ra = 0) {
+    void issue_read_aheads(unsigned additional = 0) {
         if (_done) {
             return;
         }
-        auto ra = std::max(min_ra, _options.read_ahead);
+        auto ra = _current_read_ahead + additional;
         _read_buffers.reserve(ra); // prevent push_back() failure
         while (_read_buffers.size() < ra) {
             if (!_remain) {
-                if (_read_buffers.size() >= min_ra) {
+                if (_read_buffers.size() >= additional) {
                     return;
                 }
-                _read_buffers.push_back(make_ready_future<temporary_buffer<char>>());
+                _read_buffers.emplace_back(_pos, 0, make_ready_future<temporary_buffer<char>>());
                 continue;
             }
             ++_reads_in_progress;
@@ -80,18 +249,18 @@ private:
             // Also avoid reading beyond _remain.
             uint64_t align = _file.disk_read_dma_alignment();
             auto start = align_down(_pos, align);
-            auto end = align_up(std::min(start + _options.buffer_size, _pos + _remain), align);
+            auto end = std::min(align_up(start + _current_buffer_size, align), _pos + _remain);
             auto len = end - start;
-            _read_buffers.push_back(futurize<future<temporary_buffer<char>>>::apply([&] {
+            auto actual_size = std::min(end - _pos, _remain);
+            _read_buffers.emplace_back(_pos, actual_size, futurize<future<temporary_buffer<char>>>::apply([&] {
                     return _file.dma_read_bulk<char>(start, len, _options.io_priority_class);
             }).then_wrapped(
-                    [this, start, end, pos = _pos, remain = _remain] (future<temporary_buffer<char>> ret) {
-                issue_read_aheads();
+                    [this, start, pos = _pos, remain = _remain] (future<temporary_buffer<char>> ret) {
                 --_reads_in_progress;
                 if (_done && !_reads_in_progress) {
                     _done->set_value();
                 }
-                if ((pos == start && end <= pos + remain) || ret.failed()) {
+                if (ret.failed()) {
                     // no games needed
                     return ret;
                 } else {
@@ -110,9 +279,8 @@ private:
                     return make_ready_future<temporary_buffer<char>>(std::move(tmp));
                 }
             }));
-            auto old_pos = _pos;
+            _remain -= end - _pos;
             _pos = end;
-            _remain = std::max(_pos, old_pos + _remain) - _pos;
         };
     }
 };
@@ -219,7 +387,17 @@ public:
         }
 
         return _file.dma_write(pos, p, buf_size, _options.io_priority_class).then(
-                [this, buf = std::move(buf), truncate] (size_t size) {
+                [this, pos, buf = std::move(buf), truncate, buf_size] (size_t size) mutable {
+            // short write handling
+            if (size < buf_size) {
+                buf.trim_front(size);
+                return do_put(pos + size, std::move(buf)).then([this, truncate] {
+                    if (truncate) {
+                        return _file.truncate(_pos);
+                    }
+                    return make_ready_future<>();
+                });
+            }
             if (truncate) {
                 return _file.truncate(_pos);
             }
@@ -266,5 +444,13 @@ output_stream<char> make_file_output_stream(file f, size_t buffer_size) {
 
 output_stream<char> make_file_output_stream(file f, file_output_stream_options options) {
     return output_stream<char>(file_data_sink(std::move(f), options), options.buffer_size, true);
+}
+
+/*
+ * template initialization, definition in iostream-impl.hh
+ */
+template struct internal::stream_copy_consumer<char>;
+template future<> copy<char>(input_stream<char>&, output_stream<char>&);
+
 }
 

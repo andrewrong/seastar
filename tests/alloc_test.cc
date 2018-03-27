@@ -24,7 +24,7 @@
 #include "core/reactor.hh"
 #include <vector>
 
-
+using namespace seastar;
 
 SEASTAR_TEST_CASE(alloc_almost_all_and_realloc_it_with_a_smaller_size) {
 #ifndef DEFAULT_ALLOCATOR
@@ -36,6 +36,15 @@ SEASTAR_TEST_CASE(alloc_almost_all_and_realloc_it_with_a_smaller_size) {
     auto obj2 = realloc(obj, to_alloc - (1 << 20));
     BOOST_REQUIRE(obj == obj2);
     free(obj2);
+#endif
+    return make_ready_future<>();
+}
+
+SEASTAR_TEST_CASE(malloc_0_and_free_it) {
+#ifndef DEFAULT_ALLOCATOR
+    auto obj = malloc(0);
+    BOOST_REQUIRE(obj != nullptr);
+    free(obj);
 #endif
     return make_ready_future<>();
 }

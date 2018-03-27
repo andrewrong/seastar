@@ -20,7 +20,6 @@
  */
 
 
-#define BOOST_TEST_DYN_LINK
 #define BOOST_TEST_MODULE core
 
 #include <boost/test/included/unit_test.hpp>
@@ -29,6 +28,8 @@
 #include <chrono>
 #include <deque>
 #include "core/circular_buffer.hh"
+
+using namespace seastar;
 
 BOOST_AUTO_TEST_CASE(chunked_fifo_small) {
     // Check all the methods of chunked_fifo but with a trivial type (int) and

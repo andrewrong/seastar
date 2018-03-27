@@ -18,9 +18,9 @@
 /*
  * Copyright (C) 2014 Cloudius Systems, Ltd.
  */
-
 #ifdef HAVE_DPDK
 
+#include <cinttypes>
 #include "core/posix.hh"
 #include "core/vla.hh"
 #include "virtio-interface.hh"
@@ -30,12 +30,14 @@
 #include "core/align.hh"
 #include "core/sstring.hh"
 #include "core/memory.hh"
+#include "core/metrics.hh"
 #include "util/function_input_iterator.hh"
 #include "util/transform_iterator.hh"
 #include <atomic>
 #include <vector>
 #include <queue>
 #include <experimental/optional>
+#include <boost/preprocessor.hpp>
 #include "ip.hh"
 #include "const.hh"
 #include "core/dpdk_rte.hh"
@@ -45,6 +47,7 @@
 #include <getopt.h>
 #include <malloc.h>
 
+#include <cinttypes>
 #include <rte_config.h>
 #include <rte_common.h>
 #include <rte_eal.h>
@@ -78,7 +81,9 @@ void* as_cookie(struct rte_pktmbuf_pool_private& p) {
 typedef void    *MARKER[0];   /**< generic marker for a point in a structure */
 #endif
 
-using namespace net;
+using namespace seastar::net;
+
+namespace seastar {
 
 namespace dpdk {
 
@@ -170,7 +175,7 @@ uint32_t qp_mempool_obj_size(bool hugetlbfs_membackend)
     return mp_size;
 }
 
-static constexpr const char* pktmbuf_pool_name   = "dpdk_net_pktmbuf_pool";
+static constexpr const char* pktmbuf_pool_name   = "dpdk_pktmbuf_pool";
 
 /*
  * When doing reads from the NIC queues, use this batch size
@@ -208,6 +213,94 @@ struct port_stats {
     } tx;
 };
 
+#define XSTATS_ID_LIST \
+        (rx_multicast_packets) \
+        (rx_xon_packets) \
+        (rx_xoff_packets) \
+        (rx_crc_errors) \
+        (rx_length_errors) \
+        (rx_undersize_errors) \
+        (rx_oversize_errors) \
+        (tx_xon_packets) \
+        (tx_xoff_packets)
+
+class dpdk_xstats {
+public:
+    dpdk_xstats(uint8_t port_id)
+        : _port_id(port_id)
+    {
+    }
+
+    ~dpdk_xstats()
+    {
+        if (_xstats)
+            delete _xstats;
+        if (_xstat_names)
+            delete _xstat_names;
+    }
+
+    enum xstat_id {
+        BOOST_PP_SEQ_ENUM(XSTATS_ID_LIST)
+    };
+
+
+    void start() {
+        _len = rte_eth_xstats_get_names(_port_id, NULL, 0);
+        _xstats = new rte_eth_xstat[_len];
+        _xstat_names = new rte_eth_xstat_name[_len];
+        update_xstats();
+        update_xstat_names();
+        update_offsets();
+    }
+
+    void update_xstats() {
+        auto len = rte_eth_xstats_get(_port_id, _xstats, _len);
+        assert(len == _len);
+    }
+
+    uint64_t get_value(const xstat_id id) {
+        auto off = _offsets[static_cast<int>(id)];
+        return _xstats[off].value;
+    }
+
+private:
+    uint8_t _port_id;
+    int _len;
+    struct rte_eth_xstat *_xstats = nullptr;
+    struct rte_eth_xstat_name *_xstat_names = nullptr;
+    int _offsets[BOOST_PP_SEQ_SIZE(XSTATS_ID_LIST)];
+
+    static const sstring id_to_str(const xstat_id id) {
+#define ENUM_TO_STR(r, data, elem) \
+        if (id == elem) \
+            return BOOST_PP_STRINGIZE(elem);
+
+        BOOST_PP_SEQ_FOR_EACH(ENUM_TO_STR, ~, XSTATS_ID_LIST)
+        return "";
+    }
+
+    int get_offset_by_name(const xstat_id id, const int len) {
+        for (int i = 0; i < len; i++) {
+            if (id_to_str(id) == _xstat_names[i].name)
+                return i;
+        }
+        return -1;
+    }
+
+    void update_xstat_names() {
+        auto len = rte_eth_xstats_get_names(_port_id, _xstat_names, _len);
+        assert(len == _len);
+    }
+
+    void update_offsets() {
+#define FIND_OFFSET(r, data, elem) \
+        _offsets[static_cast<int>(elem)] = \
+            get_offset_by_name(elem, _len);
+
+        BOOST_PP_SEQ_FOR_EACH(FIND_OFFSET, ~, XSTATS_ID_LIST)
+    }
+};
+
 class dpdk_device : public device {
     uint8_t _port_idx;
     uint16_t _num_queues;
@@ -222,9 +315,10 @@ class dpdk_device : public device {
     timer<> _stats_collector;
     const std::string _stats_plugin_name;
     const std::string _stats_plugin_inst;
-    std::vector<scollectd::registration> _collectd_regs;
+    seastar::metrics::metric_groups _metrics;
     bool _is_i40e_device = false;
     bool _is_vmxnet3_device = false;
+    dpdk_xstats _xstats;
 
 public:
     rte_eth_dev_info _dev_info = {};
@@ -280,6 +374,7 @@ public:
         , _enable_fc(enable_fc)
         , _stats_plugin_name("network")
         , _stats_plugin_inst(std::string("port") + std::to_string(_port_idx))
+        , _xstats(port_idx)
     {
 
         /* now initialise the port we will use */
@@ -287,6 +382,10 @@ public:
         if (ret != 0) {
             rte_exit(EXIT_FAILURE, "Cannot initialise port %u\n", _port_idx);
         }
+
+        /* need to defer initialize xstats since NIC specific xstat entries
+           show up only after port initization */
+        _xstats.start();
 
         _stats_collector.set_callback([&] {
             rte_eth_stats rte_stats = {};
@@ -296,92 +395,79 @@ public:
                 printf("Failed to get port statistics: %s\n", strerror(rc));
             }
 
-            _stats.rx.good.mcast      = rte_stats.imcasts;
-            _stats.rx.good.pause_xon  = rte_stats.rx_pause_xon;
-            _stats.rx.good.pause_xoff = rte_stats.rx_pause_xoff;
+            _stats.rx.good.mcast      =
+                _xstats.get_value(dpdk_xstats::xstat_id::rx_multicast_packets);
+            _stats.rx.good.pause_xon  =
+                _xstats.get_value(dpdk_xstats::xstat_id::rx_xon_packets);
+            _stats.rx.good.pause_xoff =
+                _xstats.get_value(dpdk_xstats::xstat_id::rx_xoff_packets);
 
-            _stats.rx.bad.crc         = rte_stats.ibadcrc;
-            _stats.rx.bad.dropped     = rte_stats.imissed;
-            _stats.rx.bad.len         = rte_stats.ibadlen;
+            _stats.rx.bad.crc        =
+                _xstats.get_value(dpdk_xstats::xstat_id::rx_crc_errors);
+            _stats.rx.bad.len         =
+                _xstats.get_value(dpdk_xstats::xstat_id::rx_length_errors) +
+                _xstats.get_value(dpdk_xstats::xstat_id::rx_undersize_errors) +
+                _xstats.get_value(dpdk_xstats::xstat_id::rx_oversize_errors);
             _stats.rx.bad.total       = rte_stats.ierrors;
 
-            _stats.tx.good.pause_xon  = rte_stats.tx_pause_xon;
-            _stats.tx.good.pause_xoff = rte_stats.tx_pause_xoff;
+            _stats.tx.good.pause_xon  =
+                _xstats.get_value(dpdk_xstats::xstat_id::tx_xon_packets);
+            _stats.tx.good.pause_xoff =
+                _xstats.get_value(dpdk_xstats::xstat_id::tx_xoff_packets);
 
             _stats.tx.bad.total       = rte_stats.oerrors;
         });
 
-        // Register port statistics collectd pollers
-        // Rx Good
-        _collectd_regs.push_back(
-            scollectd::add_polled_metric(scollectd::type_instance_id(
-                          _stats_plugin_name
-                        , _stats_plugin_inst
-                        , "if_multicast", _stats_plugin_inst + " Rx Multicast")
-                        , scollectd::make_typed(scollectd::data_type::DERIVE
-                        , _stats.rx.good.mcast)
-        ));
+        // Register port statistics pollers
+        namespace sm = seastar::metrics;
+        _metrics.add_group(_stats_plugin_name, {
+            // Rx Good
+            sm::make_derive("rx_multicast", _stats.rx.good.mcast,
+                            sm::description("Counts a number of received multicast packets."), {sm::shard_label(_stats_plugin_inst)}),
+            // Rx Errors
+            sm::make_derive("rx_crc_errors", _stats.rx.bad.crc,
+                            sm::description("Counts a number of received packets with a bad CRC value. "
+                                            "A non-zero value of this metric usually indicates a HW problem, e.g. a bad cable."), {sm::shard_label(_stats_plugin_inst)}),
 
-        // Rx Errors
-        _collectd_regs.push_back(
-            scollectd::add_polled_metric(scollectd::type_instance_id(
-                          _stats_plugin_name
-                        , _stats_plugin_inst
-                        , "if_rx_errors", "Bad CRC")
-                        , scollectd::make_typed(scollectd::data_type::DERIVE
-                        , _stats.rx.bad.crc)
-        ));
-        _collectd_regs.push_back(
-            scollectd::add_polled_metric(scollectd::type_instance_id(
-                          _stats_plugin_name
-                        , _stats_plugin_inst
-                        , "if_rx_errors", "Dropped")
-                        , scollectd::make_typed(scollectd::data_type::DERIVE
-                        , _stats.rx.bad.dropped)
-        ));
-        _collectd_regs.push_back(
-            scollectd::add_polled_metric(scollectd::type_instance_id(
-                          _stats_plugin_name
-                        , _stats_plugin_inst
-                        , "if_rx_errors", "Bad Length")
-                        , scollectd::make_typed(scollectd::data_type::DERIVE
-                        , _stats.rx.bad.len)
-        ));
+            sm::make_derive("rx_dropped", _stats.rx.bad.dropped,
+                            sm::description("Counts a number of dropped received packets. "
+                                            "A non-zero value of this counter indicated the overflow of ingress HW buffers. "
+                                            "This usually happens because of a rate of a sender on the other side of the link is higher than we can process as a receiver."), {sm::shard_label(_stats_plugin_inst)}),
 
-        // Coupled counters:
-        // Good
-        _collectd_regs.push_back(
-            scollectd::add_polled_metric(scollectd::type_instance_id(
-                          _stats_plugin_name
-                        , _stats_plugin_inst
-                        , "if_packets", _stats_plugin_inst + " Pause XON")
-                        , scollectd::make_typed(scollectd::data_type::DERIVE
-                        , _stats.rx.good.pause_xon)
-                        , scollectd::make_typed(scollectd::data_type::DERIVE
-                        , _stats.tx.good.pause_xon)
-        ));
-        _collectd_regs.push_back(
-            scollectd::add_polled_metric(scollectd::type_instance_id(
-                          _stats_plugin_name
-                        , _stats_plugin_inst
-                        , "if_packets", _stats_plugin_inst + " Pause XOFF")
-                        , scollectd::make_typed(scollectd::data_type::DERIVE
-                        , _stats.rx.good.pause_xoff)
-                        , scollectd::make_typed(scollectd::data_type::DERIVE
-                        , _stats.tx.good.pause_xoff)
-        ));
+            sm::make_derive("rx_bad_length_errors", _stats.rx.bad.len,
+                            sm::description("Counts a number of received packets with a bad length value. "
+                                            "A non-zero value of this metric usually indicates a HW issue: e.g. bad cable."), {sm::shard_label(_stats_plugin_inst)}),
+            // Coupled counters:
+            // Good
+            sm::make_derive("rx_pause_xon", _stats.rx.good.pause_xon,
+                            sm::description("Counts a number of received PAUSE XON frames (PAUSE frame with a quanta of zero). "
+                                            "When PAUSE XON frame is received our port may resume sending L2 frames. "
+                                            "PAUSE XON frames are sent to resume sending that was previously paused with a PAUSE XOFF frame. If ingress "
+                                            "buffer falls below the low watermark threshold before the timeout configured in the original PAUSE XOFF frame the receiver may decide to send PAUSE XON frame. "
+                                            "A non-zero value of this metric may mean that our sender is bursty and that the spikes overwhelm the receiver on the other side of the link."), {sm::shard_label(_stats_plugin_inst)}),
 
-        // Errors
-        _collectd_regs.push_back(
-            scollectd::add_polled_metric(scollectd::type_instance_id(
-                          _stats_plugin_name
-                        , _stats_plugin_inst
-                        , "if_errors", _stats_plugin_inst)
-                        , scollectd::make_typed(scollectd::data_type::DERIVE
-                        , _stats.rx.bad.total)
-                        , scollectd::make_typed(scollectd::data_type::DERIVE
-                        , _stats.tx.bad.total)
-        ));
+            sm::make_derive("tx_pause_xon", _stats.tx.good.pause_xon,
+                            sm::description("Counts a number of sent PAUSE XON frames (L2 flow control frames). "
+                                            "A non-zero value of this metric indicates that our ingress path doesn't keep up with the rate of a sender on the other side of the link. "
+                                            "Note that if a sender port respects PAUSE frames this will prevent it from sending from ALL its egress queues because L2 flow control is defined "
+                                            "on a per-link resolution."), {sm::shard_label(_stats_plugin_inst)}),
+
+            sm::make_derive("rx_pause_xoff", _stats.rx.good.pause_xoff,
+                            sm::description("Counts a number of received PAUSE XOFF frames. "
+                                            "A non-zero value of this metric indicates that our egress overwhelms the receiver on the other side of the link and it has to send PAUSE frames to make us stop sending. "
+                                            "Note that if our port respects PAUSE frames a reception of a PAUSE XOFF frame will cause ALL egress queues of this port to stop sending."), {sm::shard_label(_stats_plugin_inst)}),
+
+            sm::make_derive("tx_pause_xoff", _stats.tx.good.pause_xoff,
+                            sm::description("Counts a number of sent PAUSE XOFF frames. "
+                                            "A non-zero value of this metric indicates that our ingress path (SW and HW) doesn't keep up with the rate of a sender on the other side of the link and as a result "
+                                            "our ingress HW buffers overflow."), {sm::shard_label(_stats_plugin_inst)}),
+            // Errors
+            sm::make_derive("rx_errors", _stats.rx.bad.total,
+                            sm::description("Counts the total number of ingress errors: CRC errors, bad length errors, etc."), {sm::shard_label(_stats_plugin_inst)}),
+
+            sm::make_derive("tx_errors", _stats.tx.bad.total,
+                            sm::description("Counts a total number of egress errors. A non-zero value usually indicated a problem with a HW or a SW driver."), {sm::shard_label(_stats_plugin_inst)}),
+        });
     }
 
     ~dpdk_device() {
@@ -1865,32 +1951,19 @@ dpdk_qp<HugetlbfsMemBackend>::dpdk_qp(dpdk_device* dev, uint8_t qid,
     }
 
     // Register error statistics: Rx total and checksum errors
-    _collectd_regs.push_back(
-        scollectd::add_polled_metric(scollectd::type_instance_id(
-                      _stats_plugin_name
-                    , scollectd::per_cpu_plugin_instance
-                    , "if_rx_errors", "Bad CSUM")
-                    , scollectd::make_typed(scollectd::data_type::DERIVE
-                    , _stats.rx.bad.csum)
-    ));
+    namespace sm = seastar::metrics;
+    _metrics.add_group(_stats_plugin_name, {
+        sm::make_derive(_queue_name + "_rx_csum_errors", _stats.rx.bad.csum,
+                        sm::description("Counts a number of packets received by this queue that have a bad CSUM value. "
+                                        "A non-zero value of this metric usually indicates a HW issue, e.g. a bad cable.")),
 
-    _collectd_regs.push_back(
-        scollectd::add_polled_metric(scollectd::type_instance_id(
-                      _stats_plugin_name
-                    , scollectd::per_cpu_plugin_instance
-                    , "if_rx_errors", "Total")
-                    , scollectd::make_typed(scollectd::data_type::DERIVE
-                    , _stats.rx.bad.total)
-    ));
+        sm::make_derive(_queue_name + "_rx_errors", _stats.rx.bad.total,
+                        sm::description("Counts a total number of errors in the ingress path for this queue: CSUM errors, etc.")),
 
-    _collectd_regs.push_back(
-        scollectd::add_polled_metric(scollectd::type_instance_id(
-                      _stats_plugin_name
-                    , scollectd::per_cpu_plugin_instance
-                    , "if_rx_errors", "No Memory")
-                    , scollectd::make_typed(scollectd::data_type::DERIVE
-                    , _stats.rx.bad.no_mem)
-    ));
+        sm::make_derive(_queue_name + "_rx_no_memory_errors", _stats.rx.bad.no_mem,
+                        sm::description("Counts a number of ingress packets received by this HW queue but dropped by the SW due to low memory. "
+                                        "A non-zero value indicates that seastar doesn't have enough memory to handle the packet reception or the memory is too fragmented.")),
+    });
 }
 
 template <bool HugetlbfsMemBackend>
@@ -2176,7 +2249,7 @@ std::unique_ptr<qp> dpdk_device::init_local_queue(boost::program_options::variab
             init_port_fini();
         }
     });
-    return std::move(qp);
+    return qp;
 }
 } // namespace dpdk
 
@@ -2206,11 +2279,23 @@ std::unique_ptr<net::device> create_dpdk_net_device(
                                                enable_fc);
 }
 
+std::unique_ptr<net::device> create_dpdk_net_device(
+                                    const hw_config& hw_cfg)
+{
+    return create_dpdk_net_device(*hw_cfg.port_index, smp::count, hw_cfg.lro, hw_cfg.hw_fc);
+}
+
+
 boost::program_options::options_description
 get_dpdk_net_options_description()
 {
     boost::program_options::options_description opts(
             "DPDK net options");
+
+    opts.add_options()
+        ("dpdk-port-index",
+                boost::program_options::value<unsigned>()->default_value(0),
+                "DPDK Port Index");
 
     opts.add_options()
         ("hw-fc",
@@ -2230,6 +2315,8 @@ get_dpdk_net_options_description()
         ;
 #endif
     return opts;
+}
+
 }
 
 #endif // HAVE_DPDK

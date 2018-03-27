@@ -30,13 +30,13 @@
 #include <memory>
 #include <vector>
 #include <algorithm>
-#include "core/scollectd.hh"
+#include "core/metrics.hh"
 #include "core/align.hh"
 #include "core/memory.hh"
 
-static constexpr uint16_t SLAB_MAGIC_NUMBER = 0x51AB; // meant to be 'SLAB' :-)
+namespace seastar {
 
-namespace bi = boost::intrusive;
+static constexpr uint16_t SLAB_MAGIC_NUMBER = 0x51AB; // meant to be 'SLAB' :-)
 
 /*
  * Item requirements
@@ -52,8 +52,8 @@ namespace bi = boost::intrusive;
  */
 struct slab_page_desc {
 private:
-    bi::list_member_hook<> _lru_link;
-    bi::list_member_hook<> _free_pages_link;
+    boost::intrusive::list_member_hook<> _lru_link;
+    boost::intrusive::list_member_hook<> _free_pages_link;
     void *_slab_page;
     std::vector<uintptr_t> _free_objects;
     uint32_t _refcnt;
@@ -126,7 +126,7 @@ public:
 };
 
 class slab_item_base {
-    bi::list_member_hook<> _lru_link;
+    boost::intrusive::list_member_hook<> _lru_link;
 
     template<typename Item>
     friend class slab_class;
@@ -135,11 +135,11 @@ class slab_item_base {
 template<typename Item>
 class slab_class {
 private:
-    bi::list<slab_page_desc,
-        bi::member_hook<slab_page_desc, bi::list_member_hook<>,
+    boost::intrusive::list<slab_page_desc,
+        boost::intrusive::member_hook<slab_page_desc, boost::intrusive::list_member_hook<>,
         &slab_page_desc::_free_pages_link>> _free_slab_pages;
-    bi::list<slab_item_base,
-        bi::member_hook<slab_item_base, bi::list_member_hook<>,
+    boost::intrusive::list<slab_item_base,
+        boost::intrusive::member_hook<slab_item_base, boost::intrusive::list_member_hook<>,
         &slab_item_base::_lru_link>> _lru;
     size_t _size; // size of objects
     uint8_t _slab_class_id;
@@ -278,12 +278,12 @@ class slab_allocator {
 private:
     std::vector<size_t> _slab_class_sizes;
     std::vector<slab_class<Item>> _slab_classes;
-    std::vector<scollectd::registration> _registrations;
+    seastar::metrics::metric_groups _metrics;
     // erase_func() is used to remove the item from the cache using slab.
     std::function<void (Item& item_ref)> _erase_func;
     std::vector<slab_page_desc*> _slab_pages_vector;
-    bi::list<slab_page_desc,
-        bi::member_hook<slab_page_desc, bi::list_member_hook<>,
+    boost::intrusive::list<slab_page_desc,
+        boost::intrusive::member_hook<slab_page_desc, boost::intrusive::list_member_hook<>,
         &slab_page_desc::_lru_link>> _slab_page_desc_lru;
     uint64_t _max_object_size;
     uint64_t _available_slab_pages;
@@ -398,18 +398,15 @@ private:
         return &_slab_classes[slab_class_id];
     }
 
-    void register_collectd_metrics() {
-        auto add = [this] (auto type_name, auto name, auto data_type, auto func) {
-            _registrations.push_back(
-                scollectd::add_polled_metric(scollectd::type_instance_id("slab",
-                    scollectd::per_cpu_plugin_instance,
-                    type_name, name),
-                    scollectd::make_typed(data_type, func)));
-        };
-
-        add("total_operations", "malloc", scollectd::data_type::DERIVE, [&] { return _stats.allocs; });
-        add("total_operations", "free", scollectd::data_type::DERIVE, [&] { return _stats.frees; });
-        add("objects", "malloc", scollectd::data_type::GAUGE, [&] { return _stats.allocs - _stats.frees; });
+    void register_metrics() {
+        namespace sm = seastar::metrics;
+        _metrics.add_group("slab", {
+            sm::make_derive("malloc_total_operations", sm::description("Total number of slab malloc operations"), _stats.allocs),
+            sm::make_derive("free_total_operations", sm::description("Total number of slab free operations"), _stats.frees),
+            sm::make_gauge("malloc_objects", sm::description("Number of slab created objects currently in memory"), [this] {
+                return _stats.allocs - _stats.frees;
+            })
+        });
     }
 
     inline slab_page_desc& get_slab_page_desc(Item *item)
@@ -430,7 +427,7 @@ public:
         , _available_slab_pages(limit / max_object_size)
     {
         initialize_slab_allocator(growth_factor, limit);
-        register_collectd_metrics();
+        register_metrics();
     }
 
     slab_allocator(double growth_factor, uint64_t limit, uint64_t max_object_size,
@@ -440,7 +437,7 @@ public:
         , _available_slab_pages(limit / max_object_size)
     {
         initialize_slab_allocator(growth_factor, limit);
-        register_collectd_metrics();
+        register_metrics();
     }
 
     ~slab_allocator()
@@ -453,7 +450,6 @@ public:
             ::free(desc->slab_page());
             delete desc;
         }
-        _registrations.clear();
         delete _reclaimer;
     }
 
@@ -568,5 +564,7 @@ public:
         return (slab_class) ? slab_class->size() : 0;
     }
 };
+
+}
 
 #endif /* __SLAB_ALLOCATOR__ */

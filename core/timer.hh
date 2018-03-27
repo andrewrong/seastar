@@ -24,8 +24,11 @@
 #include <chrono>
 #include <experimental/optional>
 #include <atomic>
+#include <functional>
 #include "future.hh"
 #include "timer-set.hh"
+
+namespace seastar {
 
 using steady_clock_type = std::chrono::steady_clock;
 
@@ -66,6 +69,8 @@ public:
     bool cancel();
     time_point get_timeout();
     friend class reactor;
-    friend class seastar::timer_set<timer, &timer::_link>;
+    friend class timer_set<timer, &timer::_link>;
 };
+
+}
 

@@ -41,6 +41,9 @@
 #include "core/shared_ptr.hh"
 #include "toeplitz.hh"
 #include "net/udp.hh"
+#include "core/metrics_registration.hh"
+
+namespace seastar {
 
 namespace net {
 
@@ -107,14 +110,18 @@ std::ostream& operator<<(std::ostream& os, ipv4_address a);
 
 }
 
+}
+
 namespace std {
 
 template <>
-struct hash<net::ipv4_address> {
-    size_t operator()(net::ipv4_address a) const { return a.ip; }
+struct hash<seastar::net::ipv4_address> {
+    size_t operator()(seastar::net::ipv4_address a) const { return a.ip; }
 };
 
 }
+
+namespace seastar {
 
 namespace net {
 
@@ -134,7 +141,7 @@ struct ipv4_traits {
     static void udp_pseudo_header_checksum(checksummer& csum, ipv4_address src, ipv4_address dst, uint16_t len) {
         csum.sum_many(src.ip.raw, dst.ip.raw, uint8_t(0), uint8_t(ip_protocol_num::udp), len);
     }
-    static constexpr uint8_t ip_hdr_len_min = net::ipv4_hdr_len_min;
+    static constexpr uint8_t ip_hdr_len_min = ipv4_hdr_len_min;
 };
 
 template <ip_protocol_num ProtoNum>
@@ -362,7 +369,7 @@ private:
     timer<lowres_clock> _frag_timer;
     circular_buffer<l3_protocol::l3packet> _packetq;
     unsigned _pkt_provider_idx = 0;
-    scollectd::registrations _collectd_regs;
+    metrics::metric_groups _metrics;
 private:
     future<> handle_received_packet(packet p, ethernet_address from);
     bool forward(forward_hash& out_hash_data, packet& p, size_t off);
@@ -465,6 +472,8 @@ struct l4connid<InetTraits>::connid_hash : private std::hash<ipaddr>, private st
 };
 
 void arp_learn(ethernet_address l2, ipv4_address l3);
+
+}
 
 }
 

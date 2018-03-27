@@ -23,10 +23,12 @@
 #define MEMORY_HH_
 
 #include "resource.hh"
+#include "bitops.hh"
 #include <new>
 #include <functional>
 #include <vector>
 
+namespace seastar {
 
 /// \defgroup memory-module Memory management
 ///
@@ -52,17 +54,38 @@
 namespace memory {
 
 /// \cond internal
-// TODO: Use getpagesize() in order to learn a size of a system PAGE.
-static constexpr size_t page_bits = 12;
-static constexpr size_t page_size = 1 << page_bits;       // 4K
-static constexpr size_t huge_page_size = 512 * page_size; // 2M
 
-void configure(std::vector<resource::memory> m,
+#ifdef SEASTAR_OVERRIDE_ALLOCATOR_PAGE_SIZE
+#define SEASTAR_INTERNAL_ALLOCATOR_PAGE_SIZE (SEASTAR_OVERRIDE_ALLOCATOR_PAGE_SIZE)
+#else
+#define SEASTAR_INTERNAL_ALLOCATOR_PAGE_SIZE 4096
+#endif
+
+static constexpr size_t page_size = SEASTAR_INTERNAL_ALLOCATOR_PAGE_SIZE;
+static constexpr size_t page_bits = log2ceil(page_size);
+static constexpr size_t huge_page_size =
+#if defined(__x86_64__) || defined(__i386__) || defined(__s390x__) || defined(__zarch__)
+    1 << 21; // 2M
+#elif defined(__aarch64__)
+    1 << 21; // 2M
+#elif defined(__PPC__)
+    1 << 24; // 16M
+#else
+#error "Huge page size is not defined for this architecture"
+#endif
+
+void configure(std::vector<resource::memory> m, bool mbind,
         std::experimental::optional<std::string> hugetlbfs_path = {});
 
 void enable_abort_on_allocation_failure();
 
-void* allocate_reclaimable(size_t size);
+class disable_abort_on_alloc_failure_temporarily {
+public:
+    disable_abort_on_alloc_failure_temporarily();
+    ~disable_abort_on_alloc_failure_temporarily() noexcept;
+};
+
+void set_heap_profiling_enabled(bool);
 
 enum class reclaiming_result {
     reclaimed_nothing,
@@ -185,6 +208,64 @@ struct memory_layout {
 // Supported only when seastar allocator is enabled.
 memory::memory_layout get_memory_layout();
 
+/// Returns the value of free memory low water mark in bytes.
+/// When free memory is below this value, reclaimers are invoked until it goes above again.
+size_t min_free_memory();
+
+/// Sets the value of free memory low water mark in memory::page_size units.
+void set_min_free_pages(size_t pages);
+
+/// Enable the large allocation warning threshold.
+///
+/// Warn when allocation above a given threshold are performed.
+///
+/// \param threshold size (in bytes) above which an allocation will be logged
+void set_large_allocation_warning_threshold(size_t threshold);
+
+/// Gets the current large allocation warning threshold.
+size_t get_large_allocation_warning_threshold();
+
+/// Disable large allocation warnings.
+void disable_large_allocation_warning();
+
+/// Set a different large allocation warning threshold for a scope.
+class scoped_large_allocation_warning_threshold {
+    size_t _old_threshold;
+public:
+    explicit scoped_large_allocation_warning_threshold(size_t threshold)
+            : _old_threshold(get_large_allocation_warning_threshold()) {
+        set_large_allocation_warning_threshold(threshold);
+    }
+    scoped_large_allocation_warning_threshold(const scoped_large_allocation_warning_threshold&) = delete;
+    scoped_large_allocation_warning_threshold(scoped_large_allocation_warning_threshold&& x) = delete;
+    ~scoped_large_allocation_warning_threshold() {
+        if (_old_threshold) {
+            set_large_allocation_warning_threshold(_old_threshold);
+        }
+    }
+    void operator=(const scoped_large_allocation_warning_threshold&) const = delete;
+    void operator=(scoped_large_allocation_warning_threshold&&) = delete;
+};
+
+/// Disable large allocation warnings for a scope.
+class scoped_large_allocation_warning_disable {
+    size_t _old_threshold;
+public:
+    scoped_large_allocation_warning_disable()
+            : _old_threshold(get_large_allocation_warning_threshold()) {
+        disable_large_allocation_warning();
+    }
+    scoped_large_allocation_warning_disable(const scoped_large_allocation_warning_disable&) = delete;
+    scoped_large_allocation_warning_disable(scoped_large_allocation_warning_disable&& x) = delete;
+    ~scoped_large_allocation_warning_disable() {
+        if (_old_threshold) {
+            set_large_allocation_warning_threshold(_old_threshold);
+        }
+    }
+    void operator=(const scoped_large_allocation_warning_disable&) const = delete;
+    void operator=(scoped_large_allocation_warning_disable&&) = delete;
+};
+
 }
 
 class with_alignment {
@@ -194,28 +275,11 @@ public:
     size_t alignment() const { return _align; }
 };
 
-void* operator new(size_t size, with_alignment wa);
-void* operator new[](size_t size, with_alignment wa);
-void operator delete(void* ptr, with_alignment wa);
-void operator delete[](void* ptr, with_alignment wa);
+}
 
-template <typename T, size_t Align>
-class aligned_allocator {
-public:
-    using value_type = T;
-    T* allocate(size_t n) const {
-        // FIXME: multiply can overflow?
-        return reinterpret_cast<T*>(::operator new(n * sizeof(T), with_alignment(Align)));
-    }
-    void deallocate(T* ptr) const {
-        return ::operator delete(ptr, with_alignment(Align));
-    }
-    bool operator==(const aligned_allocator& x) const {
-        return true;
-    }
-    bool operator!=(const aligned_allocator& x) const {
-        return false;
-    }
-};
+void* operator new(size_t size, seastar::with_alignment wa);
+void* operator new[](size_t size, seastar::with_alignment wa);
+void operator delete(void* ptr, seastar::with_alignment wa);
+void operator delete[](void* ptr, seastar::with_alignment wa);
 
 #endif /* MEMORY_HH_ */

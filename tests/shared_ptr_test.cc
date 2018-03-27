@@ -20,7 +20,6 @@
  * Copyright 2015 Cloudius Systems
  */
 
-#define BOOST_TEST_DYN_LINK
 #define BOOST_TEST_MODULE core
 
 #include <boost/test/included/unit_test.hpp>
@@ -28,6 +27,8 @@
 #include <unordered_map>
 #include "core/sstring.hh"
 #include "core/shared_ptr.hh"
+
+using namespace seastar;
 
 struct expected_exception : public std::exception {};
 

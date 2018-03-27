@@ -25,6 +25,10 @@
 #include "net.hh"
 #include <utility>
 #include "toeplitz.hh"
+#include "core/metrics.hh"
+#include "inet_address.hh"
+
+namespace seastar {
 
 using std::move;
 
@@ -43,6 +47,13 @@ ipv4_addr::ipv4_addr(const std::string &addr) {
 }
 
 ipv4_addr::ipv4_addr(const std::string &addr, uint16_t port_) : ip(boost::asio::ip::address_v4::from_string(addr).to_ulong()), port(port_) {}
+
+ipv4_addr::ipv4_addr(const net::inet_address& a, uint16_t port)
+    : ipv4_addr([&a] {
+  ::in_addr in = a;
+  return net::ntoh(in.s_addr);
+}(), port)
+{}
 
 namespace net {
 
@@ -78,132 +89,85 @@ qp::qp(bool register_copy_stats,
         : _tx_poller(reactor::poller::simple([this] { return poll_tx(); }))
         , _stats_plugin_name(stats_plugin_name)
         , _queue_name(std::string("queue") + std::to_string(qid))
-        , _collectd_regs({
-
-            //
-            // Packets rate: DERIVE:0:u
-            //
-            scollectd::add_polled_metric(scollectd::type_instance_id(
-                    _stats_plugin_name
-                    , scollectd::per_cpu_plugin_instance
-                    , "if_packets", _queue_name)
-                    , scollectd::make_typed(scollectd::data_type::DERIVE
-                    , _stats.rx.good.packets)
-                    , scollectd::make_typed(scollectd::data_type::DERIVE
-                    , _stats.tx.good.packets)
-            ),
-            //
-            // Bytes rate: DERIVE:0:U
-            //
-            scollectd::add_polled_metric(scollectd::type_instance_id(
-                    _stats_plugin_name
-                    , scollectd::per_cpu_plugin_instance
-                    , "if_octets", _queue_name)
-                    , scollectd::make_typed(scollectd::data_type::DERIVE
-                    , _stats.rx.good.bytes)
-                    , scollectd::make_typed(scollectd::data_type::DERIVE
-                    , _stats.tx.good.bytes)
-            ),
-
-            //
-            // Queue length: GAUGE:0:U
-            //
-            // Tx
-            scollectd::add_polled_metric(scollectd::type_instance_id(
-                    _stats_plugin_name
-                    , scollectd::per_cpu_plugin_instance
-                    , "queue_length", "tx-packet-queue")
-                    , scollectd::make_typed(scollectd::data_type::GAUGE
-                    , std::bind(&decltype(_tx_packetq)::size, &_tx_packetq))
-            ),
-
-            //
-            // Linearization counter: DERIVE:0:U
-            //
-            scollectd::add_polled_metric(scollectd::type_instance_id(
-                    _stats_plugin_name
-                    , scollectd::per_cpu_plugin_instance
-                    , "total_operations", "xmit-linearized")
-                    , scollectd::make_typed(scollectd::data_type::DERIVE
-                    , _stats.tx.linearized)
-            ),
-
-            //
-            // Number of packets in last bunch: GAUGE:0:U
-            //
-            // Tx
-            scollectd::add_polled_metric(scollectd::type_instance_id(
-                    _stats_plugin_name
-                    , scollectd::per_cpu_plugin_instance
-                    , "requests", "tx-packet-queue-last-bunch")
-                    , scollectd::make_typed(scollectd::data_type::GAUGE
-                    , _stats.tx.good.last_bunch)
-            ),
-            // Rx
-            scollectd::add_polled_metric(scollectd::type_instance_id(
-                    _stats_plugin_name
-                    , scollectd::per_cpu_plugin_instance
-                    , "requests", "rx-packet-queue-last-bunch")
-                    , scollectd::make_typed(scollectd::data_type::GAUGE
-                    , _stats.rx.good.last_bunch)
-            ),
-
-            //
-            // Fragments rate: DERIVE:0:U
-            //
-            // Tx
-            scollectd::add_polled_metric(scollectd::type_instance_id(
-                    _stats_plugin_name
-                    , scollectd::per_cpu_plugin_instance
-                    , "total_operations", "tx-frags")
-                    , scollectd::make_typed(scollectd::data_type::DERIVE
-                    , _stats.tx.good.nr_frags)
-            ),
-            // Rx
-            scollectd::add_polled_metric(scollectd::type_instance_id(
-                    _stats_plugin_name
-                    , scollectd::per_cpu_plugin_instance
-                    , "total_operations", "rx-frags")
-                    , scollectd::make_typed(scollectd::data_type::DERIVE
-                    , _stats.rx.good.nr_frags)
-            ),
-    })
 {
-    if (register_copy_stats) {
+    namespace sm = metrics;
+
+    _metrics.add_group(_stats_plugin_name, {
         //
-        // Non-zero-copy data bytes rate: DERIVE:0:u
+        // Packets rate: DERIVE:0:u
         //
-        _collectd_regs.push_back(
-            scollectd::add_polled_metric(scollectd::type_instance_id(
-                    _stats_plugin_name
-                    , scollectd::per_cpu_plugin_instance
-                    , "if_octets", _queue_name + " Copy Bytes")
-                    , scollectd::make_typed(scollectd::data_type::DERIVE
-                    , _stats.rx.good.copy_bytes)
-                    , scollectd::make_typed(scollectd::data_type::DERIVE
-                    , _stats.tx.good.copy_bytes)
-            ));
+        sm::make_derive(_queue_name + "_rx_packets", _stats.rx.good.packets,
+                        sm::description("This metric is a receive packet rate for this queue.")),
+
+        sm::make_derive(_queue_name + "_tx_packets", _stats.tx.good.packets,
+                        sm::description("This metric is a transmit packet rate for this queue.")),
         //
-        // Non-zero-copy data fragments rate: DERIVE:0:u
+        // Bytes rate: DERIVE:0:U
+        //
+        sm::make_derive(_queue_name + "_rx_bytes", _stats.rx.good.bytes,
+                        sm::description("This metric is a receive throughput for this queue.")),
+
+        sm::make_derive(_queue_name + "_tx_bytes", _stats.tx.good.bytes,
+                        sm::description("This metric is a transmit throughput for this queue.")),
+        //
+        // Queue length: GAUGE:0:U
         //
         // Tx
-        _collectd_regs.push_back(
-            scollectd::add_polled_metric(scollectd::type_instance_id(
-                    _stats_plugin_name
-                    , scollectd::per_cpu_plugin_instance
-                    , "total_operations", "tx-frags-copy")
-                    , scollectd::make_typed(scollectd::data_type::DERIVE
-                    , _stats.tx.good.copy_frags)
-            ));
+        sm::make_gauge(_queue_name + "_tx_packet_queue", [this] { return _tx_packetq.size(); },
+                        sm::description("Holds a number of packets pending to be sent. "
+                                        "This metric will have high values if the network backend doesn't keep up with the upper layers or if upper layers send big bursts of packets.")),
+
+        //
+        // Linearization counter: DERIVE:0:U
+        //
+        sm::make_derive(_queue_name + "_xmit_linearized", _stats.tx.linearized,
+                        sm::description("Counts a number of linearized Tx packets. High value indicates that we send too fragmented packets.")),
+
+        //
+        // Number of packets in last bunch: GAUGE:0:U
+        //
+        // Tx
+        sm::make_gauge(_queue_name + "_tx_packet_queue_last_bunch", _stats.tx.good.last_bunch,
+                        sm::description(format("Holds a number of packets sent in the bunch. "
+                                        "A high value in conjunction with a high value of a {} indicates an efficient Tx packets bulking.", _queue_name + "_tx_packet_queue"))),
         // Rx
-        _collectd_regs.push_back(
-            scollectd::add_polled_metric(scollectd::type_instance_id(
-                    _stats_plugin_name
-                    , scollectd::per_cpu_plugin_instance
-                    , "total_operations", "rx-frags-copy")
-                    , scollectd::make_typed(scollectd::data_type::DERIVE
-                    , _stats.rx.good.copy_frags)
-            ));
+        sm::make_gauge(_queue_name + "_rx_packet_queue_last_bunch", _stats.rx.good.last_bunch,
+                        sm::description("Holds a number of packets received in the last Rx bunch. High value indicates an efficient Rx packets bulking.")),
+
+        //
+        // Fragments rate: DERIVE:0:U
+        //
+        // Tx
+        sm::make_derive(_queue_name + "_tx_frags", _stats.tx.good.nr_frags,
+                        sm::description(format("Counts a number of sent fragments. Divide this value by a {} to get an average number of fragments in a Tx packet.", _queue_name + "_tx_packets"))),
+        // Rx
+        sm::make_derive(_queue_name + "_rx_frags", _stats.rx.good.nr_frags,
+                        sm::description(format("Counts a number of received fragments. Divide this value by a {} to get an average number of fragments in an Rx packet.", _queue_name + "_rx_packets"))),
+    });
+
+    if (register_copy_stats) {
+        _metrics.add_group(_stats_plugin_name, {
+            //
+            // Non-zero-copy data bytes rate: DERIVE:0:u
+            //
+            // Tx
+            sm::make_derive(_queue_name + "_tx_copy_bytes", _stats.tx.good.copy_bytes,
+                        sm::description(format("Counts a number of sent bytes that were handled in a non-zero-copy way. Divide this value by a {} to get a portion of data sent using a non-zero-copy flow.", _queue_name + "_tx_bytes"))),
+            // Rx
+            sm::make_derive(_queue_name + "_rx_copy_bytes", _stats.rx.good.copy_bytes,
+                        sm::description(format("Counts a number of received bytes that were handled in a non-zero-copy way. Divide this value by an {} to get a portion of received data handled using a non-zero-copy flow.", _queue_name + "_rx_bytes"))),
+
+            //
+            // Non-zero-copy data fragments rate: DERIVE:0:u
+            //
+            // Tx
+            sm::make_derive(_queue_name + "_tx_copy_frags", _stats.tx.good.copy_frags,
+                        sm::description(format("Counts a number of sent fragments that were handled in a non-zero-copy way. Divide this value by a {} to get a portion of fragments sent using a non-zero-copy flow.", _queue_name + "_tx_frags"))),
+            // Rx
+            sm::make_derive(_queue_name + "_rx_copy_frags", _stats.rx.good.copy_frags,
+                        sm::description(format("Counts a number of received fragments that were handled in a non-zero-copy way. Divide this value by a {} to get a portion of received fragments handled using a non-zero-copy flow.", _queue_name + "_rx_frags"))),
+
+        });
     }
 }
 
@@ -250,7 +214,7 @@ subscription<packet>
 device::receive(std::function<future<> (packet)> next_packet) {
     auto sub = _queues[engine().cpu_id()]->_rx_stream.listen(std::move(next_packet));
     _queues[engine().cpu_id()]->rx_start();
-    return std::move(sub);
+    return sub;
 }
 
 void device::set_local_queue(std::unique_ptr<qp> dev) {
@@ -366,6 +330,8 @@ future<> interface::dispatch_packet(packet p) {
         }
     }
     return make_ready_future<>();
+}
+
 }
 
 }

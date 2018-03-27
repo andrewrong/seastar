@@ -38,6 +38,12 @@
 #include "net/byteorder.hh"
 #include "core/shared_ptr.hh"
 #include "core/sstring.hh"
+#include "core/print.hh"
+#include "util/log.hh"
+
+#include "core/metrics_api.hh"
+
+namespace seastar {
 
 /**
  * Implementation of rudimentary collectd data gathering.
@@ -79,13 +85,9 @@
 
 namespace scollectd {
 
-// The value binding data types
-enum class data_type : uint8_t {
-    COUNTER, // unsigned int 64
-    GAUGE, // double
-    DERIVE, // signed int 64
-    ABSOLUTE, // unsigned int 64
-};
+extern seastar::logger logger;
+
+using data_type = seastar::metrics::impl::data_type;
 
 enum class known_type {
     // from types.db. Defined collectd types (type_id) selection.
@@ -287,46 +289,45 @@ static inline typed<T> make_typed(data_type type, T&& t) {
     return typed<T>(type, std::forward<T>(t));
 }
 
-typedef sstring plugin_id;
-typedef sstring plugin_instance_id;
-typedef sstring type_id;
-typedef sstring type_instance;
+using plugin_id = seastar::metrics::group_name_type;
+using plugin_instance_id = seastar::metrics::instance_id_type;
+using type_id = seastar::metrics::metric_type_def;
+using type_instance = seastar::metrics::metric_name_type;
 
 type_id type_id_for(known_type);
 
-/*
- * Human-readable description of a metric/group.
- * Uses a separate class to deal with type resolution
- *
- * Add this to either typed wrappers or raw counter
- * registration:
- *
- * <code>
- * add_polled_metric(type_instance_id("my_plug", "my_inst", "total_operations", "value"),
- *  description("This is a counter description that should have content"),
- *  make_typed(data_type::DERIVE, _my_counter_var)
- *  );
- * </code>
- *
- */
-class description {
-public:
-    description(sstring s = sstring()) : _s(std::move(s))
-    {}
-    const sstring& str() const {
-        return _s;
-    }
-private:
-    sstring _s;
-};
+using description = seastar::metrics::description;
+
+static constexpr unsigned max_collectd_field_text_len = 63;
 
 class type_instance_id {
+    static thread_local unsigned _next_truncated_idx;
+
+    /// truncate a given field to the maximum allowed length
+    void truncate(sstring& field, const char* field_desc) {
+        if (field.size() > max_collectd_field_text_len) {
+            auto suffix_len = std::ceil(std::log10(++_next_truncated_idx)) + 1;
+            sstring new_field(seastar::format("{}~{:d}", sstring(field.data(), max_collectd_field_text_len - suffix_len), _next_truncated_idx));
+
+            logger.warn("Truncating \"{}\" to {} chars: \"{}\" -> \"{}\"", field_desc, max_collectd_field_text_len, field, new_field);
+            field = std::move(new_field);
+        }
+    }
 public:
     type_instance_id() = default;
     type_instance_id(plugin_id p, plugin_instance_id pi, type_id t,
                     scollectd::type_instance ti = std::string())
                     : _plugin(std::move(p)), _plugin_instance(std::move(pi)), _type(
                                     std::move(t)), _type_instance(std::move(ti)) {
+        // truncate strings to the maximum allowed length
+        truncate(_plugin, "plugin");
+        truncate(_plugin_instance, "plugin_instance");
+        truncate(_type, "type");
+        truncate(_type_instance, "type_instance");
+    }
+    type_instance_id(const seastar::metrics::impl::metric_id &id) : _plugin(id.group_name()),
+            _plugin_instance(id.instance_id()), _type(id.inherit_type()),
+            _type_instance(id.name()) {
     }
     type_instance_id(type_instance_id &&) = default;
     type_instance_id(const type_instance_id &) = default;
@@ -377,17 +378,11 @@ class plugin_instance_metrics;
  */
 struct registration {
     registration() = default;
-    registration(const type_instance_id& id)
-    : _id(id) {
-    }
-    registration(type_instance_id&& id)
-    : _id(std::move(id)) {
-    }
+    registration(const type_instance_id& id);
+    registration(type_instance_id&& id);
     registration(const registration&) = delete;
     registration(registration&&) = default;
-    ~registration() {
-        unregister();
-    }
+    ~registration();
     registration & operator=(const registration&) = delete;
     registration & operator=(registration&&) = default;
 
@@ -397,8 +392,8 @@ struct registration {
     }
 private:
     friend class plugin_instance_metrics;
-
     type_instance_id _id;
+    shared_ptr<seastar::metrics::impl::impl> _impl;
 };
 
 /**
@@ -456,7 +451,7 @@ struct typed_value {
 private:
     type_id _type_id;
     scollectd::type_instance _type_instance;
-    ::shared_ptr<value_list> _values;
+    shared_ptr<value_list> _values;
 };
 
 class plugin_instance_metrics {
@@ -510,7 +505,9 @@ struct typed_value_impl: public typed_value {
     {}
 };
 
-/**
+/*!
+ * \deprecated metrics registration should be done using the metrics layer
+ *
  * Some typedefs for common used types. Feel free to add.
  */
 typedef typed_value_impl<known_type::total_bytes> total_bytes;
@@ -748,15 +745,23 @@ static auto make_type_instance(description d, _Args && ... args) -> values_impl 
     return values_impl<decltype(value<_Args>(std::forward<_Args>(args)))...>(
                     std::move(d), value<_Args>(std::forward<_Args>(args))...);
 }
+/*!
+ * \deprecated metrics registration should be done using the metrics layer
+ *
+ */
 template<typename ... _Args>
-static type_instance_id add_polled_metric(const plugin_id & plugin,
+[[deprecated("Use the metrics layer")]] static type_instance_id add_polled_metric(const plugin_id & plugin,
         const plugin_instance_id & plugin_instance, const type_id & type,
         const scollectd::type_instance & type_instance, _Args&& ... args) {
     return add_polled_metric(plugin, plugin_instance, type, type_instance, description(),
             std::forward<_Args>(args)...);
 }
+/*!
+ * \deprecated metrics registration should be done using the metrics layer
+ *
+ */
 template<typename ... _Args>
-static type_instance_id add_polled_metric(const plugin_id & plugin,
+[[deprecated("Use the metrics layer")]] static type_instance_id add_polled_metric(const plugin_id & plugin,
         const plugin_instance_id & plugin_instance, const type_id & type,
         const scollectd::type_instance & type_instance, description d, _Args&& ... args) {
     return add_polled_metric(
@@ -779,29 +784,44 @@ static notify_function create_explicit_metric(const plugin_id & plugin,
             type_instance_id(plugin, plugin_instance, type, type_instance),
             std::forward<_Args>(args)...);
 }
-template<typename ... _Args>
-static type_instance_id add_polled_metric(const type_instance_id & id,
-        _Args&& ... args) {
-    return add_polled_metric(id, description(), std::forward<_Args>(args)...);
-}
-template<typename ... _Args>
-static type_instance_id add_polled_metric(const type_instance_id & id, description d,
-        _Args&& ... args) {
-    typedef decltype(make_type_instance(std::move(d), std::forward<_Args>(args)...)) impl_type;
-    add_polled(id,
-            ::make_shared<impl_type>(
-                    make_type_instance(std::move(d), std::forward<_Args>(args)...)));
+
+seastar::metrics::impl::metric_id to_metrics_id(const type_instance_id & id);
+/*!
+ * \deprecated metrics registration should be done using the metrics layer
+ *
+ */
+template<typename Arg>
+[[deprecated("Use the metrics layer")]] static type_instance_id add_polled_metric(const type_instance_id & id, description d,
+        Arg&& arg, bool enabled = true) {
+    namespace sm = seastar::metrics::impl;
+
+    seastar::metrics::impl::get_local_impl()->add_registration(to_metrics_id(id), arg.type, sm::make_function(arg.value, arg.type), d, enabled);
     return id;
+}
+/*!
+ * \deprecated metrics registration should be done using the metrics layer
+ *
+ */
+template<typename Arg>
+[[deprecated("Use the metrics layer")]] static type_instance_id add_polled_metric(const type_instance_id & id,
+        Arg&& arg) {
+    return std::move(add_polled_metric(id, description(), std::forward<Arg>(arg)));
 }
 
-template<typename ... Args>
-static type_instance_id add_disabled_polled_metric(const type_instance_id & id, description d,
-        Args&& ... args) {
-    typedef decltype(make_type_instance(std::move(d), std::forward<Args>(args)...)) impl_type;
-    add_polled(id,
-            ::make_shared<impl_type>(
-                    make_type_instance(std::move(d), std::forward<Args>(args)...)), false);
-    return id;
+/*!
+ * \deprecated metrics registration should be done using the metrics layer
+ *
+ */
+template<typename Args>
+[[deprecated("Use the metrics layer")]] static type_instance_id add_disabled_polled_metric(const type_instance_id & id, description d,
+        Args&& arg) {
+    return add_polled_metric(id, d, std::forward<Args>(arg), false);
+}
+
+template<typename Args>
+static type_instance_id add_disabled_polled_metric(const type_instance_id & id,
+        Args&& args) {
+    return add_disabled_polled_metric(id, description(), std::forward<Args>(args));
 }
 
 template<typename ... Args>
@@ -830,11 +850,13 @@ template<typename... Args>
 typed_value::typed_value(const type_id& tid, const scollectd::type_instance& ti, description d, Args&&... args)
     : _type_id(tid)
     , _type_instance(ti)
-    , _values(::make_shared<decltype(make_type_instance(std::move(d), std::forward<Args>(args)...))>(make_type_instance(std::move(d), std::forward<Args>(args)...)))
+    , _values(::seastar::make_shared<decltype(make_type_instance(std::move(d), std::forward<Args>(args)...))>(make_type_instance(std::move(d), std::forward<Args>(args)...)))
 {}
 
 // Send a message packet (string)
 future<> send_notification(const type_instance_id & id, const sstring & msg);
 };
+
+}
 
 #endif /* SCOLLECTD_HH_ */

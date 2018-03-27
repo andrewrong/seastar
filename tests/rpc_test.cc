@@ -87,7 +87,7 @@ inline sstring read(serializer, Input& in, rpc::type<sstring>) {
 using test_rpc_proto = rpc::protocol<serializer>;
 using connect_fn = std::function<test_rpc_proto::client (ipv4_addr addr)>;
 
-class rpc_socket_impl : public net::socket_impl {
+class rpc_socket_impl : public ::net::socket_impl {
     promise<connected_socket> _p;
     bool _connect;
     loopback_socket_impl _socket;
@@ -160,7 +160,7 @@ SEASTAR_TEST_CASE(test_rpc_connect) {
             }
             co.send_timeout_data = j & 2;
             auto f = with_rpc_env({}, co, so, true, [] (test_rpc_proto& proto, test_rpc_proto::server& s, connect_fn connect) {
-                return seastar::async([&proto, &s, connect] {
+                return seastar::async([&proto, connect] {
                     auto c1 = connect(ipv4_addr());
                     auto sum = proto.register_handler(1, [](int a, int b) {
                         return make_ready_future<int>(a+b);
@@ -169,6 +169,8 @@ SEASTAR_TEST_CASE(test_rpc_connect) {
                     BOOST_REQUIRE_EQUAL(result, 2 + 3);
                     c1.stop().get();
                 });
+            }).handle_exception([] (auto ep) {
+                BOOST_FAIL("No exception expected");
             }).finally([factory = std::move(factory), i, j = j & 1] {
                 if (i == 1 && j == 1) {
                     BOOST_REQUIRE_EQUAL(factory->use_compression, 2);
@@ -192,7 +194,7 @@ SEASTAR_TEST_CASE(test_rpc_connect_multi_compression_algo) {
     so.compressor_factory = &server;
     co.compressor_factory = &client;
     return with_rpc_env({}, co, so, true, [] (test_rpc_proto& proto, test_rpc_proto::server& s, connect_fn connect) {
-        return seastar::async([&proto, &s, connect] {
+        return seastar::async([&proto, connect] {
             auto c1 = connect(ipv4_addr());
             auto sum = proto.register_handler(1, [](int a, int b) {
                 return make_ready_future<int>(a+b);
@@ -209,7 +211,7 @@ SEASTAR_TEST_CASE(test_rpc_connect_multi_compression_algo) {
 
 SEASTAR_TEST_CASE(test_rpc_connect_abort) {
     return with_rpc_env({}, {}, {}, false, [] (test_rpc_proto& proto, test_rpc_proto::server& s, connect_fn connect) {
-        return seastar::async([&proto, &s, connect] {
+        return seastar::async([&proto, connect] {
             auto c1 = connect(ipv4_addr());
             auto f = proto.register_handler(1, []() { return make_ready_future<>(); });
             c1.stop().get0();
@@ -224,7 +226,7 @@ SEASTAR_TEST_CASE(test_rpc_connect_abort) {
 SEASTAR_TEST_CASE(test_rpc_cancel) {
     using namespace std::chrono_literals;
     return with_rpc_env({}, {}, {}, true, [] (test_rpc_proto& proto, test_rpc_proto::server& s, connect_fn connect) {
-        return seastar::async([&proto, &s, connect] {
+        return seastar::async([&proto, connect] {
             auto c1 = connect(ipv4_addr());
             bool rpc_executed = false;
             int good = 0;
@@ -244,7 +246,7 @@ SEASTAR_TEST_CASE(test_rpc_cancel) {
             };
             f = call(c1, cancel);
             // cancel wait side
-            f_handler_called.then([cancel = std::move(cancel)] () mutable {
+            f_handler_called.then([&cancel] {
                 cancel.cancel();
             }).get();
             try {
@@ -254,6 +256,27 @@ SEASTAR_TEST_CASE(test_rpc_cancel) {
             };
             c1.stop().get();
             BOOST_REQUIRE_EQUAL(good, 11);
+        });
+    });
+}
+
+SEASTAR_TEST_CASE(test_message_to_big) {
+    return with_rpc_env({0, 1, 100}, {}, {}, true, [] (test_rpc_proto& proto, test_rpc_proto::server& s, connect_fn connect) {
+        return seastar::async([&proto, connect] {
+            auto c = connect(ipv4_addr());
+            bool good = true;
+            auto call = proto.register_handler(1, [&] (sstring payload) mutable {
+                good = false;
+            });
+            try {
+                call(c, sstring(sstring::initialized_later(), 101)).get();
+                good = false;
+            } catch(std::runtime_error& err) {
+            } catch(...) {
+                good = false;
+            }
+            c.stop().get();
+            BOOST_REQUIRE_EQUAL(good, true);
         });
     });
 }

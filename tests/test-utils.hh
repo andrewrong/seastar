@@ -22,12 +22,13 @@
 
 #pragma once
 
-#define BOOST_TEST_DYN_LINK
 
 #include <boost/test/unit_test.hpp>
 
 #include "core/future.hh"
 #include "test_runner.hh"
+
+namespace seastar {
 
 class seastar_test {
 public:
@@ -48,3 +49,18 @@ public:
     static name name ## _instance; \
     future<> name::run_test_case()
 
+#define SEASTAR_THREAD_TEST_CASE(name) \
+    struct name : public seastar_test { \
+        const char* get_test_file() override { return __FILE__; } \
+        const char* get_name() override { return #name; } \
+        future<> run_test_case() override { \
+            return async([this] { \
+                do_run_test_case(); \
+            }); \
+        } \
+        void do_run_test_case(); \
+    }; \
+    static name name ## _instance; \
+    void name::do_run_test_case() \
+
+}

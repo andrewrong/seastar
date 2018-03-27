@@ -25,6 +25,8 @@
 #include "core/sleep.hh"
 #include "rpc/lz4_compressor.hh"
 
+using namespace seastar;
+
 struct serializer {
 };
 
@@ -125,6 +127,7 @@ int main(int ac, char** av) {
         auto test6 = myrpc.register_handler(6, [](const rpc::client_info& info, int x){ print("test6 client %s, %d\n", inet_ntoa(info.addr.as_posix_sockaddr_in().sin_addr), x); });
         auto test8 = myrpc.register_handler(8, [](){ print("test8 sleep for 2 sec\n"); return sleep(2s); });
         auto test13 = myrpc.register_handler(13, [](){ print("test13 sleep for 1 msec\n"); return sleep(1ms); });
+        auto test_message_to_big = myrpc.register_handler(14, [](sstring payload){ print("test message to bit, should not get here"); });
 
         if (config.count("server")) {
             std::cout << "client" << std::endl;
@@ -209,19 +212,29 @@ int main(int ac, char** av) {
                     }
                 });
                 sleep(500us).then([c] { c->cancel(); });
+                test_message_to_big(*client, sstring(sstring::initialized_later(), 10'000'001)).then_wrapped([](future<> f) {
+                    try {
+                        f.get();
+                        print("test message to big shold not get here\n");
+                    } catch(std::runtime_error& err) {
+                        print("test message to big get error %s\n", err.what());
+                    } catch(...) {
+                        print("test message to big wrong exception\n");
+                    }
+                });
             }
             // delay a little for a time-sensitive test
             sleep(400ms).then([test12] () mutable {
                 // server is configured for 10MB max, throw 25MB worth of requests at it.
-                auto now = std::chrono::steady_clock::now();
+                auto now = rpc::rpc_clock_type::now();
                 return parallel_for_each(boost::irange(0, 25), [test12, now] (int idx) mutable {
                     return test12(*client, 100, sstring(sstring::initialized_later(), 1'000'000)).then([idx, now] {
-                        auto later = std::chrono::steady_clock::now();
+                        auto later = rpc::rpc_clock_type::now();
                         auto delta = std::chrono::duration_cast<std::chrono::milliseconds>(later - now);
                         print("idx %d completed after %d ms\n", idx, delta.count());
                     });
                 }).then([now] {
-                    auto later = std::chrono::steady_clock::now();
+                    auto later = rpc::rpc_clock_type::now();
                     auto delta = std::chrono::duration_cast<std::chrono::milliseconds>(later - now);
                     print("test12 completed after %d ms (should be ~300)\n", delta.count());
                 });

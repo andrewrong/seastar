@@ -23,11 +23,30 @@
 
 #include "file.hh"
 #include <deque>
+#include <atomic>
+
+namespace seastar {
+
+class posix_file_handle_impl : public seastar::file_handle_impl {
+    int _fd;
+    std::atomic<unsigned>* _refcount;
+public:
+    posix_file_handle_impl(int fd, std::atomic<unsigned>* refcount)
+            : _fd(fd), _refcount(refcount) {
+    }
+    virtual ~posix_file_handle_impl();
+    posix_file_handle_impl(const posix_file_handle_impl&) = delete;
+    posix_file_handle_impl(posix_file_handle_impl&&) = delete;
+    virtual shared_ptr<file_impl> to_file() && override;
+    virtual std::unique_ptr<seastar::file_handle_impl> clone() const override;
+};
 
 class posix_file_impl : public file_impl {
+    std::atomic<unsigned>* _refcount = nullptr;
 public:
     int _fd;
     posix_file_impl(int fd, file_open_options options);
+    posix_file_impl(int fd, std::atomic<unsigned>* refcount);
     virtual ~posix_file_impl() override;
     future<size_t> write_dma(uint64_t pos, const void* buffer, size_t len, const io_priority_class& pc);
     future<size_t> write_dma(uint64_t pos, std::vector<iovec> iov, const io_priority_class& pc);
@@ -40,9 +59,34 @@ public:
     virtual future<> allocate(uint64_t position, uint64_t length) override;
     future<uint64_t> size();
     virtual future<> close() noexcept override;
+    virtual std::unique_ptr<seastar::file_handle_impl> dup() override;
     virtual subscription<directory_entry> list_directory(std::function<future<> (directory_entry de)> next) override;
+    virtual future<temporary_buffer<uint8_t>> dma_read_bulk(uint64_t offset, size_t range_size, const io_priority_class& pc);
 private:
     void query_dma_alignment();
+
+    /**
+     * Try to read from the given position where the previous short read has
+     * stopped. Check the EOF condition.
+     *
+     * The below code assumes the following: short reads due to I/O errors
+     * always end at address aligned to HW block boundary. Therefore if we issue
+     * a new read operation from the next position we are promised to get an
+     * error (different from EINVAL). If we've got a short read because we have
+     * reached EOF then the above read would either return a zero-length success
+     * (if the file size is aligned to HW block size) or an EINVAL error (if
+     * file length is not aligned to HW block size).
+     *
+     * @param pos offset to read from
+     * @param len number of bytes to read
+     * @param pc the IO priority class under which to queue this operation
+     *
+     * @return temporary buffer with read data or zero-sized temporary buffer if
+     *         pos is at or beyond EOF.
+     * @throw appropriate exception in case of I/O error.
+     */
+    future<temporary_buffer<uint8_t>>
+    read_maybe_eof(uint64_t pos, size_t len, const io_priority_class& pc);
 };
 
 // The Linux XFS implementation is challenged wrt. append: a write that changes
@@ -77,22 +121,24 @@ class append_challenged_posix_file_impl : public posix_file_impl {
     unsigned _max_size_changing_ops = 0;
     unsigned _current_non_size_changing_ops = 0;
     unsigned _current_size_changing_ops = 0;
+    bool _fsync_is_exclusive = true;
     // Set when the user closes the file
     bool _done = false;
     bool _sloppy_size = false;
     // Fulfiled when _done and I/O is complete
     promise<> _completed;
 private:
-    void commit_size(uint64_t size);
-    bool size_changing(const op& candidate) const;
-    bool may_dispatch(const op& candidate) const;
-    void dispatch(op& candidate);
-    void optimize_queue();
-    void process_queue();
-    bool may_quit() const;
+    void commit_size(uint64_t size) noexcept;
+    bool must_run_alone(const op& candidate) const noexcept;
+    bool size_changing(const op& candidate) const noexcept;
+    bool may_dispatch(const op& candidate) const noexcept;
+    void dispatch(op& candidate) noexcept;
+    void optimize_queue() noexcept;
+    void process_queue() noexcept;
+    bool may_quit() const noexcept;
     void enqueue(op&& op);
 public:
-    append_challenged_posix_file_impl(int fd, file_open_options options, unsigned max_size_changing_ops);
+    append_challenged_posix_file_impl(int fd, file_open_options options, unsigned max_size_changing_ops, bool fsync_is_exclusive);
     ~append_challenged_posix_file_impl() override;
     future<size_t> read_dma(uint64_t pos, void* buffer, size_t len, const io_priority_class& pc) override;
     future<size_t> read_dma(uint64_t pos, std::vector<iovec> iov, const io_priority_class& pc) override;
@@ -114,3 +160,4 @@ public:
     virtual future<> allocate(uint64_t position, uint64_t length) override;
 };
 
+}

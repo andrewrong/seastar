@@ -26,12 +26,14 @@
 #include "core/deleter.hh"
 #include "core/queue.hh"
 #include "core/stream.hh"
-#include "core/scollectd.hh"
+#include "core/metrics_registration.hh"
 #include "net/toeplitz.hh"
 #include "ethernet.hh"
 #include "packet.hh"
 #include "const.hh"
 #include <unordered_map>
+
+namespace seastar {
 
 namespace net {
 
@@ -81,7 +83,7 @@ struct hw_features {
     // Maximum Transmission Unit
     uint16_t mtu = 1500;
     // Maximun packet len when TCP/UDP offload is enabled
-    uint16_t max_packet_len = net::ip_packet_len_max - net::eth_hdr_len;
+    uint16_t max_packet_len = ip_packet_len_max - eth_hdr_len;
 };
 
 class l3_protocol {
@@ -221,7 +223,7 @@ class qp {
 protected:
     const std::string _stats_plugin_name;
     const std::string _queue_name;
-    scollectd::registrations _collectd_regs;
+    metrics::metric_groups _metrics;
     qp_stats _stats;
 
 public:
@@ -292,6 +294,8 @@ public:
         return forward_dst(hash2qid(hash), [hash] { return hash; });
     }
 };
+
+}
 
 }
 

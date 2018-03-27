@@ -20,13 +20,13 @@
  */
 
 
-#define BOOST_TEST_DYN_LINK
 #define BOOST_TEST_MODULE core
 
 #include <boost/test/included/unit_test.hpp>
 #include "net/packet.hh"
 #include <array>
 
+using namespace seastar;
 using namespace net;
 
 BOOST_AUTO_TEST_CASE(test_headers_are_contiguous) {

@@ -22,12 +22,26 @@
 #ifndef UTIL_DEFER_HH_
 #define UTIL_DEFER_HH_
 
+namespace seastar {
+
 template <typename Func>
 class deferred_action {
     Func _func;
     bool _cancelled = false;
 public:
-    deferred_action(Func&& func) : _func(std::move(func)) {}
+    static_assert(std::is_nothrow_move_constructible<Func>::value, "Func(Func&&) must be noexcept");
+    deferred_action(Func&& func) noexcept : _func(std::move(func)) {}
+    deferred_action(deferred_action&& o) noexcept : _func(std::move(o._func)), _cancelled(o._cancelled) {
+        o._cancelled = true;
+    }
+    deferred_action& operator=(deferred_action&& o) noexcept {
+        if (this != &o) {
+            this->~deferred_action();
+            new (this) deferred_action(std::move(o));
+        }
+        return *this;
+    }
+    deferred_action(const deferred_action&) = delete;
     ~deferred_action() { if (!_cancelled) { _func(); }; }
     void cancel() { _cancelled = true; }
 };
@@ -37,6 +51,8 @@ inline
 deferred_action<Func>
 defer(Func&& func) {
     return deferred_action<Func>(std::forward<Func>(func));
+}
+
 }
 
 #endif /* UTIL_DEFER_HH_ */

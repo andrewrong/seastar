@@ -22,22 +22,63 @@
 #include "app-template.hh"
 #include "core/reactor.hh"
 #include "core/scollectd.hh"
+#include "core/metrics_api.hh"
+#include <boost/program_options.hpp>
 #include "core/print.hh"
+#include "util/log.hh"
+#include "util/log-cli.hh"
 #include <boost/program_options.hpp>
 #include <boost/make_shared.hpp>
 #include <fstream>
 #include <cstdlib>
 
+namespace seastar {
+
 namespace bpo = boost::program_options;
 
-app_template::app_template()
-        : _opts("App options") {
-    _opts.add_options()
-            ("help,h", "show help message")
-            ;
-    _opts.add(reactor::get_options_description());
-    _opts.add(smp::get_options_description());
-    _opts.add(scollectd::get_options_description());
+app_template::app_template(app_template::config cfg)
+    : _cfg(std::move(cfg))
+    , _opts(_cfg.name + " options")
+    , _conf_reader(get_default_configuration_reader()) {
+        _opts.add_options()
+                ("help,h", "show help message")
+                ;
+
+        _opts_conf_file.add(reactor::get_options_description(cfg.default_task_quota));
+        _opts_conf_file.add(seastar::metrics::get_options_description());
+        _opts_conf_file.add(smp::get_options_description());
+        _opts_conf_file.add(scollectd::get_options_description());
+        _opts_conf_file.add(log_cli::get_options_description());
+
+        _opts.add(_opts_conf_file);
+}
+
+app_template::configuration_reader app_template::get_default_configuration_reader() {
+    return [this] (bpo::variables_map& configuration) {
+        auto home = std::getenv("HOME");
+        if (home) {
+            std::ifstream ifs(std::string(home) + "/.config/seastar/seastar.conf");
+            if (ifs) {
+                bpo::store(bpo::parse_config_file(ifs, _opts_conf_file), configuration);
+            }
+            std::ifstream ifs_io(std::string(home) + "/.config/seastar/io.conf");
+            if (ifs_io) {
+                bpo::store(bpo::parse_config_file(ifs_io, _opts_conf_file), configuration);
+            }
+        }
+    };
+}
+
+void app_template::set_configuration_reader(configuration_reader conf_reader) {
+    _conf_reader = conf_reader;
+}
+
+boost::program_options::options_description& app_template::get_options_description() {
+    return _opts;
+}
+
+boost::program_options::options_description& app_template::get_conf_file_options_description() {
+    return _opts_conf_file;
 }
 
 boost::program_options::options_description_easy_init
@@ -93,31 +134,39 @@ app_template::run_deprecated(int ac, char ** av, std::function<void ()>&& func) 
                     .positional(_pos_opts)
                     .run()
             , configuration);
-        auto home = std::getenv("HOME");
-        if (home) {
-            std::ifstream ifs(std::string(home) + "/.config/seastar/seastar.conf");
-            if (ifs) {
-                bpo::store(bpo::parse_config_file(ifs, _opts), configuration);
-            }
-            std::ifstream ifs_io(std::string(home) + "/.config/seastar/io.conf");
-            if (ifs_io) {
-                bpo::store(bpo::parse_config_file(ifs_io, _opts), configuration);
-            }
-        }
+        _conf_reader(configuration);
     } catch (bpo::error& e) {
         print("error: %s\n\nTry --help.\n", e.what());
         return 2;
     }
-    bpo::notify(configuration);
     if (configuration.count("help")) {
         std::cout << _opts << "\n";
         return 1;
     }
+    if (configuration["help-loggers"].as<bool>()) {
+        log_cli::print_available_loggers(std::cout);
+        return 1;
+    }
+
+    bpo::notify(configuration);
+
+    // Needs to be before `smp::configure()`.
+    try {
+        apply_logging_settings(log_cli::extract_settings(configuration));
+    } catch (const std::runtime_error& exn) {
+        std::cout << "logging configuration error: " << exn.what() << '\n';
+        return 1;
+    }
+
     configuration.emplace("argv0", boost::program_options::variable_value(std::string(av[0]), false));
     smp::configure(configuration);
     _configuration = {std::move(configuration)};
     engine().when_started().then([this] {
-        scollectd::configure( this->configuration());
+        seastar::metrics::configure(this->configuration()).then([this] {
+            // set scollectd use the metrics configuration, so the later
+            // need to be set first
+            scollectd::configure( this->configuration());
+        });
     }).then(
         std::move(func)
     ).then_wrapped([] (auto&& f) {
@@ -131,4 +180,6 @@ app_template::run_deprecated(int ac, char ** av, std::function<void ()>&& func) 
     auto exit_code = engine().run();
     smp::cleanup();
     return exit_code;
+}
+
 }

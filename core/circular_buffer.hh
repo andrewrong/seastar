@@ -22,20 +22,37 @@
 #ifndef CIRCULAR_BUFFER_HH_
 #define CIRCULAR_BUFFER_HH_
 
-// A growable double-ended queue container that can be efficiently
-// extended (and shrunk) from both ends.  Implementation is a single
-// storage vector.
-//
-// Similar to libstdc++'s std::deque, except that it uses a single level
-// store, and so is more efficient for simple stored items.
-// Similar to boost::circular_buffer_space_optimized, except it uses
-// uninitialized storage for unoccupied elements (and thus move/copy
-// constructors instead of move/copy assignments, which are less efficient).
-
 #include "transfer.hh"
+#include "bitops.hh"
 #include <memory>
 #include <algorithm>
 
+namespace seastar {
+
+/// A growable double-ended queue container that can be efficiently
+/// extended (and shrunk) from both ends. Implementation is a single
+/// storage vector.
+///
+/// Similar to libstdc++'s std::deque, except that it uses a single
+/// level store, and so is more efficient for simple stored items.
+/// Similar to boost::circular_buffer_space_optimized, except it uses
+/// uninitialized storage for unoccupied elements (and thus move/copy
+/// constructors instead of move/copy assignments, which are less
+/// efficient).
+///
+/// The storage of the circular_buffer is expanded automatically in
+/// exponential increments.
+/// When adding new elements:
+/// * if size + 1 > capacity: all iterators and references are
+///     invalidated,
+/// * otherwise only the begin() or end() iterator is invalidated:
+///     * push_front() and emplace_front() will invalidate begin() and
+///     * push_back() and emplace_back() will invalidate end().
+/// Removing elements never invalidates any references and only
+/// invalidates begin() or end() iterators:
+///     * pop_front() will invalidate begin() and
+///     * pop_back() will invalidate end().
+/// reserve() may also invalidate all iterators and references.
 template <typename T, typename Alloc = std::allocator<T>>
 class circular_buffer {
     struct impl : Alloc {
@@ -55,11 +72,11 @@ public:
     using const_pointer = const T*;
 public:
     circular_buffer() = default;
-    circular_buffer(circular_buffer&& X);
+    circular_buffer(circular_buffer&& X) noexcept;
     circular_buffer(const circular_buffer& X) = delete;
     ~circular_buffer();
     circular_buffer& operator=(const circular_buffer&) = delete;
-    circular_buffer& operator=(circular_buffer&&) = delete;
+    circular_buffer& operator=(circular_buffer&& b) noexcept;
     void push_front(const T& data);
     void push_front(T&& data);
     template <typename... A>
@@ -69,7 +86,9 @@ public:
     template <typename... A>
     void emplace_back(A&&... args);
     T& front();
+    const T& front() const;
     T& back();
+    const T& back() const;
     void pop_front();
     void pop_back();
     bool empty() const;
@@ -77,6 +96,7 @@ public:
     size_t capacity() const;
     void reserve(size_t);
     T& operator[](size_t idx);
+    const T& operator[](size_t idx) const;
     template <typename Func>
     void for_each(Func func);
     // access an element, may return wrong or destroyed element
@@ -181,6 +201,7 @@ public:
     const_iterator cend() const {
         return const_iterator(this, _impl.end);
     }
+    iterator erase(iterator first, iterator last);
 };
 
 template <typename T, typename Alloc>
@@ -216,15 +237,26 @@ inline
 void
 circular_buffer<T, Alloc>::reserve(size_t size) {
     if (capacity() < size) {
-        expand(size);
+        // Make sure that the new capacity is a power of two.
+        expand(size_t(1) << log2ceil(size));
     }
 }
 
 template <typename T, typename Alloc>
 inline
-circular_buffer<T, Alloc>::circular_buffer(circular_buffer&& x)
+circular_buffer<T, Alloc>::circular_buffer(circular_buffer&& x) noexcept
     : _impl(std::move(x._impl)) {
     x._impl = {};
+}
+
+template <typename T, typename Alloc>
+inline
+circular_buffer<T, Alloc>& circular_buffer<T, Alloc>::operator=(circular_buffer&& x) noexcept {
+    if (this != &x) {
+        this->~circular_buffer();
+        new (this) circular_buffer(std::move(x));
+    }
+    return *this;
 }
 
 template <typename T, typename Alloc>
@@ -362,8 +394,22 @@ circular_buffer<T, Alloc>::front() {
 
 template <typename T, typename Alloc>
 inline
+const T&
+circular_buffer<T, Alloc>::front() const {
+    return _impl.storage[mask(_impl.begin)];
+}
+
+template <typename T, typename Alloc>
+inline
 T&
 circular_buffer<T, Alloc>::back() {
+    return _impl.storage[mask(_impl.end - 1)];
+}
+
+template <typename T, typename Alloc>
+inline
+const T&
+circular_buffer<T, Alloc>::back() const {
     return _impl.storage[mask(_impl.end - 1)];
 }
 
@@ -392,9 +438,48 @@ circular_buffer<T, Alloc>::operator[](size_t idx) {
 
 template <typename T, typename Alloc>
 inline
+const T&
+circular_buffer<T, Alloc>::operator[](size_t idx) const {
+    return _impl.storage[mask(_impl.begin + idx)];
+}
+
+template <typename T, typename Alloc>
+inline
 T&
 circular_buffer<T, Alloc>::access_element_unsafe(size_t idx) {
     return _impl.storage[mask(_impl.begin + idx)];
+}
+
+template <typename T, typename Alloc>
+inline
+typename circular_buffer<T, Alloc>::iterator
+circular_buffer<T, Alloc>::erase(iterator first, iterator last) {
+    static_assert(std::is_nothrow_move_assignable<T>::value, "erase() assumes move assignment does not throw");
+    if (first == last) {
+        return last;
+    }
+    // Move to the left or right depending on which would result in least amount of moves.
+    // This also guarantees that iterators will be stable when removing from either front or back.
+    if (std::distance(begin(), first) < std::distance(last, end())) {
+        auto new_start = std::move_backward(begin(), first, last);
+        auto i = begin();
+        while (i < new_start) {
+            _impl.destroy(&*i++);
+        }
+        _impl.begin = new_start.idx;
+        return last;
+    } else {
+        auto new_end = std::move(last, end(), first);
+        auto i = new_end;
+        auto e = end();
+        while (i < e) {
+            _impl.destroy(&*i++);
+        }
+        _impl.end = new_end.idx;
+        return first;
+    }
+}
+
 }
 
 #endif /* CIRCULAR_BUFFER_HH_ */

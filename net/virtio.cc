@@ -28,6 +28,7 @@
 #include "core/stream.hh"
 #include "core/circular_buffer.hh"
 #include "core/align.hh"
+#include "core/metrics.hh"
 #include "util/function_input_iterator.hh"
 #include "util/transform_iterator.hh"
 #include <atomic>
@@ -43,6 +44,8 @@
 #ifdef HAVE_OSV
 #include <osv/virtio-assign.hh>
 #endif
+
+namespace seastar {
 
 using namespace net;
 
@@ -664,7 +667,7 @@ qp::rxq::prepare_buffers() {
         if (available.try_wait(opportunistic)) {
             count += opportunistic;
         }
-        auto make_buffer_chain = [this] {
+        auto make_buffer_chain = [] {
             single_buffer bc;
             std::unique_ptr<char[], free_deleter> buf(reinterpret_cast<char*>(malloc(4096)));
             buffer_and_virt& b = bc[0];
@@ -1014,6 +1017,8 @@ get_virtio_net_options_description()
 
 std::unique_ptr<net::device> create_virtio_net_device(boost::program_options::variables_map opts) {
     return std::make_unique<virtio::device>(opts);
+}
+
 }
 
 // Locks the shared object in memory and forces on-load function resolution.

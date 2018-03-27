@@ -26,23 +26,32 @@
 #include <memory>
 #include <vector>
 #include <cmath>
-#include <libaio.h>
 #include <wordexp.h>
 #include <boost/thread/barrier.hpp>
 #include <boost/filesystem.hpp>
+#include <boost/range/irange.hpp>
+#include <boost/program_options.hpp>
+#include <boost/iterator/counting_iterator.hpp>
 #include <mutex>
 #include <deque>
 #include <queue>
 #include <fstream>
+#include <future>
+#include "core/linux-aio.hh"
 #include "core/sstring.hh"
 #include "core/posix.hh"
-#include "core/reactor.hh"
 #include "core/resource.hh"
+#include "core/aligned_buffer.hh"
 #include "util/defer.hh"
 
+using namespace seastar;
+using namespace seastar::internal;
 using namespace std::chrono_literals;
 
+namespace seastar {
 bool filesystem_has_good_aio_support(sstring directory, bool verbose);
+}
+
 class iotune_manager;
 
 class iotune_timeout_exception : public std::exception {
@@ -93,6 +102,7 @@ public:
     static constexpr uint64_t wbuffer_size = 128ul << 10;
     static constexpr uint64_t rbuffer_size = 4ul << 10;
 private:
+    size_t _num_threads;
     // We need all threads to synchronize and start the various phases at the same time.
     // Each of them will serve a purpose:
     //
@@ -103,10 +113,6 @@ private:
     // All threads must finish before we can compute results. Therefore, after finishing,
     // they all must gather around _finish_run_barrier
     boost::barrier _finish_run_barrier;
-    // After computing the results, the coordinator thread will decide whether
-    // or not to proceed with another round. All threads synchronize again at
-    // this point to wait for that decision.
-    boost::barrier _results_barrier;
 
     // We need a synchronization point once more, when deciding at which time
     // to start counting requests. We will avoid a barrier here due to its
@@ -126,7 +132,25 @@ private:
     // add its information here.
     run_stats _test_result;
     std::mutex _result_mutex;
-    std::vector<std::thread> _threads;
+    struct async_obj {
+        async_obj(std::packaged_task<void()> task)
+            : _future(task.get_future())
+            , _thread(std::move(task)) {}
+        async_obj() = default;
+        async_obj(async_obj&&) = default;
+        ~async_obj() {
+            if (_thread.joinable()) {
+                _thread.join();
+            }
+            if (_future.valid()) {
+                _future.get();
+            }
+        }
+    private:
+        std::future<void> _future;
+        std::thread _thread;
+    };
+    std::vector<async_obj> _async_objs;
 
     iotune_manager::clock::time_point _run_start_time;
     iotune_manager::clock::time_point _maximum_end_time;
@@ -318,10 +342,10 @@ private:
     }
 public:
     iotune_manager(size_t n, sstring dirname, std::chrono::seconds timeout)
-        : _start_run_barrier(n)
+        : _num_threads(n)
+        , _start_run_barrier(n)
         , _finish_run_barrier(n)
-        , _results_barrier(n)
-        , _time_run_atomic(n)
+        , _time_run_atomic(0)
         , _test_file(directory(dirname))
         , _run_start_time(iotune_manager::clock::now())
         , _maximum_end_time(_run_start_time + timeout)
@@ -335,7 +359,13 @@ public:
     }
     template <typename Func>
     void spawn_new(Func&& func) {
-        _threads.emplace_back(std::thread(std::forward<Func>(func)));
+        std::packaged_task<void()> task(std::forward<Func>(func));
+        _async_objs.emplace_back(std::move(task));
+    }
+
+    void wait_for_threads() {
+        std::vector<async_obj> running;
+        std::swap(running, _async_objs);
     }
 
     clock::time_point get_start_time(size_t cpu_id) {
@@ -354,10 +384,11 @@ public:
     }
 
     unsigned get_thread_concurrency(size_t cpu_id) {
+        _time_run_atomic.fetch_add(1, std::memory_order_release);
         _start_run_barrier.wait();
         auto overall_concurrency = _next_concurrency;
-        auto my_concurrency = overall_concurrency / _threads.size();
-        if (cpu_id < (overall_concurrency % _threads.size())) {
+        auto my_concurrency = overall_concurrency / _num_threads;
+        if (cpu_id < (overall_concurrency % _num_threads)) {
             my_concurrency++;
         }
         return my_concurrency;
@@ -376,29 +407,21 @@ public:
         _finish_run_barrier.wait();
     }
 
-    test_done analyze_results(size_t cpu_id) {
-        if (cpu_id == 0) {
-            struct run_stats result = current_result(cpu_id);
-            _all_results[result.concurrency] = result.IOPS;
-            find_next_concurrency(result);
-            // Still empty, nothing else to do.
-            if (_concurrency_queue.empty()) {
-                _test_done = test_done::yes;
-            } else {
-                _next_concurrency = _concurrency_queue.front();
-                _concurrency_queue.pop();
-            }
+    test_done analyze_results() {
+        struct run_stats result = current_result(0);
+        _all_results[result.concurrency] = result.IOPS;
+        find_next_concurrency(result);
+        // Still empty, nothing else to do.
+        if (_concurrency_queue.empty()) {
+            _test_done = test_done::yes;
+        } else {
+            _next_concurrency = _concurrency_queue.front();
+            _concurrency_queue.pop();
         }
-        _time_run_atomic.fetch_add(1, std::memory_order_release);
-        _results_barrier.wait();
         return _test_done;
     }
 
     uint32_t finish_estimate() {
-        for (auto&& t: _threads) {
-            t.join();
-        }
-
         if (_best_critical_concurrency == 0) {
             std::cerr << "============= Cut here ===============" << std::endl;
             std::cerr << "Something is not right! Results found:" << std::endl;
@@ -456,8 +479,8 @@ public:
     {}
 
     iocb* issue() {
-        io_prep_pread(&_iocb, _file.get(), _buf.get(), iotune_manager::rbuffer_size, _pos_distribution(random_generator) * iotune_manager::rbuffer_size);
-        _iocb.data = this;
+        _iocb = make_read_iocb(_file.get(), _pos_distribution(random_generator) * iotune_manager::rbuffer_size, _buf.get(), iotune_manager::rbuffer_size);
+        set_user_data(_iocb, this);
         _tstamp = std::chrono::steady_clock::now();
         return &_iocb;
     }
@@ -495,10 +518,10 @@ void sanity_check_ev(const io_event& ev, size_t size) {
 }
 
 run_stats iotune_manager::issue_reads(size_t cpu_id, unsigned concurrency) {
-    io_context_t io_context = {0};
-    auto r = ::io_setup(concurrency, &io_context);
+    ::aio_context_t io_context = {0};
+    auto r = io_setup(concurrency, &io_context);
     assert(r >= 0);
-    auto destroyer = defer([&io_context] { ::io_destroy(io_context); });
+    auto destroyer = defer([&io_context] { io_destroy(io_context); });
 
     unsigned finished = 0;
     std::vector<io_event> ev;
@@ -519,13 +542,13 @@ run_stats iotune_manager::issue_reads(size_t cpu_id, unsigned concurrency) {
         iocb_vecptr.push_back(r.issue());
     }
 
-    r = ::io_submit(io_context, iocb_vecptr.size(), iocb_vecptr.data());
-    throw_kernel_error(r);
+    r = io_submit(io_context, iocb_vecptr.size(), iocb_vecptr.data());
+    throw_system_error_on(r == -1, "io_submit");
 
     struct timespec timeout = {0, 0};
     while (finished != concurrency) {
-        int n = ::io_getevents(io_context, 1, ev.size(), ev.data(), &timeout);
-        throw_kernel_error(n);
+        int n = io_getevents(io_context, 1, ev.size(), ev.data(), &timeout);
+        throw_system_error_on(n == -1, "io_getevents");
         unsigned new_req = 0;
         for (auto i = 0ul; i < size_t(n); ++i) {
             sanity_check_ev(ev[i], iotune_manager::rbuffer_size);
@@ -538,7 +561,7 @@ run_stats iotune_manager::issue_reads(size_t cpu_id, unsigned concurrency) {
             }
         }
         r = ::io_submit(io_context, new_req, iocb_vecptr.data());
-        throw_kernel_error(r);
+        throw_system_error_on(r == -1, "io_submit");
     }
     struct run_stats result;
     for (auto&& r: fds) {
@@ -557,11 +580,11 @@ void test_file::generate(iotune_manager& iotune_manager, std::chrono::seconds ti
     auto start_time = iotune_manager::clock::now();
     auto latest_tstamp = start_time;
 
-    io_context_t io_context = {0};
+    aio_context_t io_context = {0};
     auto max_aio = 128;
-    auto r = ::io_setup(max_aio, &io_context);
+    auto r = io_setup(max_aio, &io_context);
     assert(r >= 0);
-    auto destroyer = defer([&io_context] { ::io_destroy(io_context); });
+    auto destroyer = defer([&io_context] { io_destroy(io_context); });
 
     auto buf = allocate_aligned_buffer<char>(iotune_manager::wbuffer_size, 4096);
     memset(buf.get(), 0, iotune_manager::wbuffer_size);
@@ -586,26 +609,27 @@ void test_file::generate(iotune_manager& iotune_manager, std::chrono::seconds ti
         while (i < max_aio - aio_outstanding && pos < iotune_manager.file_size) {
             auto now = std::min(iotune_manager.file_size - pos, iotune_manager::wbuffer_size);
             auto& iocb = iocbs[i++];
-            iocb.data = buf.get();
-            io_prep_pwrite(&iocb, file.get(), buf.get(), now, pos);
+            iocb = make_write_iocb(file.get(), pos, buf.get(), now);
+            set_user_data(iocb, buf.get());
             pos += now;
         }
         if (i) {
-            r = ::io_submit(io_context, i, iocb_vecptr.data());
-            throw_kernel_error(r);
+            r = io_submit(io_context, i, iocb_vecptr.data());
+            throw_system_error_on(r == -1, "io_submit");
             aio_outstanding += r;
         }
         if (aio_outstanding) {
             struct timespec timeout = {0, 0};
-            int n = ::io_getevents(io_context, 1, ev.size(), ev.data(), &timeout);
-            throw_kernel_error(n);
+            int n = io_getevents(io_context, 1, ev.size(), ev.data(), &timeout);
+            throw_system_error_on(n == -1, "io_getevents");
             aio_outstanding -= n;
             for (auto i = 0ul; i < size_t(n); ++i) {
                 if (stopped_on_error) {
                     // We have given up already, just loop through so we will
                     // flush all outstanding I/O.
                     break;
-                } else if ((long(ev[i].res) == -ENOSPC) || (ev[i].res < iotune_manager::wbuffer_size)) {
+                } else if ((long(ev[i].res) == -ENOSPC)
+                        || ((ev[i].res >= 0) && (ev[i].res < ssize_t(iotune_manager::wbuffer_size)))) {
                     // FIXME: The buffer size can be cut short due to other conditions that are unrelated
                     // to ENOSPC. We should be testing it separately.
                     std::cout << " stopped early due to disk space issues. Will continue but accuracy may suffer." << std::endl;
@@ -639,15 +663,16 @@ void test_file::generate(iotune_manager& iotune_manager, std::chrono::seconds ti
 uint32_t io_queue_discovery(sstring dir, std::vector<unsigned> cpus, std::chrono::seconds timeout) {
     iotune_manager iotune_manager(cpus.size(), dir, timeout);
 
-    for (auto i = 0ul; i < cpus.size(); ++i) {
-        iotune_manager.spawn_new([&cpus, &iotune_manager, id = i] {
-            pin_this_thread(cpus[id]);
-            do {
-                auto my_concurrency = iotune_manager.get_thread_concurrency(id);
-                iotune_manager.run_test(id, my_concurrency);
-            } while (iotune_manager.analyze_results(id) == iotune_manager::test_done::no);
-        });
-    }
+    do {
+        for (auto i = 0ul; i < cpus.size(); ++i) {
+            iotune_manager.spawn_new([&iotune_manager, &cpus, id = i] {
+               pin_this_thread(cpus[id]);
+               auto my_concurrency = iotune_manager.get_thread_concurrency(id);
+               iotune_manager.run_test(id, my_concurrency);
+            });
+        }
+        iotune_manager.wait_for_threads();
+    } while (iotune_manager.analyze_results() == iotune_manager::test_done::no);
 
     return iotune_manager.finish_estimate();
 }
@@ -706,6 +731,7 @@ int main(int ac, char** av) {
     desc.add_options()
         ("help,h", "show help message")
         ("evaluation-directory", bpo::value<sstring>()->required(), "directory where to execute the evaluation")
+        ("smp,c", bpo::value<unsigned>(), "number of threads (default: one per CPU)")
         ("cpuset", bpo::value<cpuset_bpo_wrapper>(), "CPUs to use (in cpuset(7) format; default: all))")
         ("options-file", bpo::value<sstring>()->default_value("~/.config/seastar/io.conf"), "Output configuration file")
         ("format", bpo::value<sstring>()->default_value("seastar"), "Configuration file format (seastar | envfile)")
@@ -716,31 +742,46 @@ int main(int ac, char** av) {
     bpo::variables_map configuration;
     try {
         bpo::store(bpo::parse_command_line(ac, av, desc), configuration);
+        if (configuration.count("help")) {
+            std::cout << desc << "\n";
+            return 1;
+        }
+
+        bpo::notify(configuration);
     } catch (bpo::error& e) {
         print("error: %s\n\nTry --help.\n", e.what());
         return 2;
-    }
-    if (configuration.count("help")) {
-        std::cout << desc << "\n";
-        return 1;
     }
     auto format = configuration["format"].as<sstring>();
     if (format != "seastar" && format != "envfile") {
         std::cout << desc << "\n";
         return 1;
     }
-    bpo::notify(configuration);
 
     auto conf_file = configuration["options-file"].as<sstring>();
 
     std::vector<unsigned> cpuvec;
     sstring directory;
+    auto nr_cpus = resource::nr_processing_units();
+    resource::cpuset cpu_set;
+    std::copy(boost::counting_iterator<unsigned>(0), boost::counting_iterator<unsigned>(nr_cpus),
+            std::inserter(cpu_set, cpu_set.end()));
+    if (configuration.count("cpuset")) {
+        cpu_set = configuration["cpuset"].as<cpuset_bpo_wrapper>().value;
+    }
+    if (configuration.count("smp")) {
+        nr_cpus = configuration["smp"].as<unsigned>();
+    } else {
+        nr_cpus = cpu_set.size();
+    }
+
     if (configuration.count("cpuset")) {
         for (auto& c: configuration["cpuset"].as<cpuset_bpo_wrapper>().value) {
-            cpuvec.push_back(c);
+            if (nr_cpus--)
+                cpuvec.push_back(c);
         }
     } else {
-        for (auto c = 0u; c < resource::nr_processing_units(); ++c) {
+        for (auto c = 0u; c < nr_cpus; ++c) {
             cpuvec.push_back(c);
         }
     }
@@ -749,7 +790,7 @@ int main(int ac, char** av) {
 
     if (!filesystem_has_good_aio_support(directory, false)) {
         std::cerr << "File system on " << directory << " is not qualified for seastar AIO;"
-                " see http://docs.scylladb.com/kb/kb-fs-not-qualified-aio/ for details\n";
+                " see http://www.scylladb.com/2016/02/09/qualifying-filesystems/ for details\n";
         return 1;
     }
     if (fs_check) {

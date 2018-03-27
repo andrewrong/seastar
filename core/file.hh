@@ -36,6 +36,8 @@
 #include <sys/uio.h>
 #include <unistd.h>
 
+namespace seastar {
+
 /// \addtogroup fileio-module
 /// @{
 
@@ -97,6 +99,18 @@ public:
 const io_priority_class& default_priority_class();
 
 class file;
+class file_impl;
+
+class file_handle;
+
+// A handle that can be transported across shards and used to
+// create a dup(2)-like `file` object referring to the same underlying file
+class file_handle_impl {
+public:
+    virtual ~file_handle_impl() = default;
+    virtual std::unique_ptr<file_handle_impl> clone() const = 0;
+    virtual shared_ptr<file_impl> to_file() && = 0;
+};
 
 class file_impl {
 protected:
@@ -119,7 +133,9 @@ public:
     virtual future<> allocate(uint64_t position, uint64_t length) = 0;
     virtual future<uint64_t> size(void) = 0;
     virtual future<> close() = 0;
+    virtual std::unique_ptr<file_handle_impl> dup();
     virtual subscription<directory_entry> list_directory(std::function<future<> (directory_entry de)> next) = 0;
+    virtual future<temporary_buffer<uint8_t>> dma_read_bulk(uint64_t offset, size_t range_size, const io_priority_class& pc) = 0;
 
     friend class reactor;
 };
@@ -154,6 +170,9 @@ public:
 
     file(shared_ptr<file_impl> impl)
             : _file_impl(std::move(impl)) {}
+
+    /// Constructs a file object from a \ref file_handle obtained from another shard
+    explicit file(file_handle&& handle);
 
     /// Checks whether the file object was initialized.
     ///
@@ -395,38 +414,55 @@ public:
      */
     template <typename CharType>
     future<temporary_buffer<CharType>>
-    dma_read_bulk(uint64_t offset, size_t range_size, const io_priority_class& pc = default_priority_class());
+    dma_read_bulk(uint64_t offset, size_t range_size, const io_priority_class& pc = default_priority_class()) {
+        return _file_impl->dma_read_bulk(offset, range_size, pc).then([] (temporary_buffer<uint8_t> t) {
+            return temporary_buffer<CharType>(reinterpret_cast<CharType*>(t.get_write()), t.size(), t.release());
+        });
+    }
 
-private:
+    /// \brief Creates a handle that can be transported across shards.
+    ///
+    /// Creates a handle that can be transported across shards, and then
+    /// used to create a new shard-local \ref file object that refers to
+    /// the same on-disk file.
+    ///
+    /// \note Use on read-only files.
+    ///
+    file_handle dup();
+
     template <typename CharType>
     struct read_state;
-
-    /**
-     * Try to read from the given position where the previous short read has
-     * stopped. Check the EOF condition.
-     *
-     * The below code assumes the following: short reads due to I/O errors
-     * always end at address aligned to HW block boundary. Therefore if we issue
-     * a new read operation from the next position we are promised to get an
-     * error (different from EINVAL). If we've got a short read because we have
-     * reached EOF then the above read would either return a zero-length success
-     * (if the file size is aligned to HW block size) or an EINVAL error (if
-     * file length is not aligned to HW block size).
-     *
-     * @param pos offset to read from
-     * @param len number of bytes to read
-     * @param pc the IO priority class under which to queue this operation
-     *
-     * @return temporary buffer with read data or zero-sized temporary buffer if
-     *         pos is at or beyond EOF.
-     * @throw appropriate exception in case of I/O error.
-     */
-    template <typename CharType>
-    future<temporary_buffer<CharType>>
-    read_maybe_eof(uint64_t pos, size_t len, const io_priority_class& pc = default_priority_class());
-
+private:
     friend class reactor;
     friend class file_impl;
+};
+
+/// \brief A shard-transportable handle to a file
+///
+/// If you need to access a file (for reads only) across multiple shards,
+/// you can use the file::dup() method to create a `file_handle`, transport
+/// this file handle to another shard, and use the handle to create \ref file
+/// object on that shard.  This is more efficient than calling open_file_dma()
+/// again.
+class file_handle {
+    std::unique_ptr<file_handle_impl> _impl;
+private:
+    explicit file_handle(std::unique_ptr<file_handle_impl> impl) : _impl(std::move(impl)) {}
+public:
+    /// Copies a file handle object
+    file_handle(const file_handle&);
+    /// Moves a file handle object
+    file_handle(file_handle&&) noexcept;
+    /// Assigns a file handle object
+    file_handle& operator=(const file_handle&);
+    /// Move-assigns a file handle object
+    file_handle& operator=(file_handle&&) noexcept;
+    /// Converts the file handle object to a \ref file.
+    file to_file() const &;
+    /// Converts the file handle object to a \ref file.
+    file to_file() &&;
+
+    friend class file;
 };
 
 /// \cond internal
@@ -497,107 +533,10 @@ private:
     uint64_t     _front;
 };
 
-template <typename CharType>
-future<temporary_buffer<CharType>>
-file::dma_read_bulk(uint64_t offset, size_t range_size, const io_priority_class& pc) {
-    using tmp_buf_type = typename read_state<CharType>::tmp_buf_type;
-
-    auto front = offset & (disk_read_dma_alignment() - 1);
-    offset -= front;
-    range_size += front;
-
-    auto rstate = make_lw_shared<read_state<CharType>>(offset, front,
-                                                       range_size,
-                                                       memory_dma_alignment(),
-                                                       disk_read_dma_alignment());
-
-    //
-    // First, try to read directly into the buffer. Most of the reads will
-    // end here.
-    //
-    auto read = dma_read(offset, rstate->buf.get_write(),
-                         rstate->buf.size(), pc);
-
-    return read.then([rstate, this, &pc] (size_t size) mutable {
-        rstate->pos = size;
-
-        //
-        // If we haven't read all required data at once -
-        // start read-copy sequence. We can't continue with direct reads
-        // into the previously allocated buffer here since we have to ensure
-        // the aligned read length and thus the aligned destination buffer
-        // size.
-        //
-        // The copying will actually take place only if there was a HW glitch.
-        // In EOF case or in case of a persistent I/O error the only overhead is
-        // an extra allocation.
-        //
-        return do_until(
-            [rstate] { return rstate->done(); },
-            [rstate, this, &pc] () mutable {
-            return read_maybe_eof<CharType>(
-                rstate->cur_offset(), rstate->left_to_read(), pc).then(
-                    [rstate] (auto buf1) mutable {
-                if (buf1.size()) {
-                    rstate->append_new_data(buf1);
-                } else {
-                    rstate->eof = true;
-                }
-
-                return make_ready_future<>();
-            });
-        }).then([rstate] () mutable {
-            //
-            // If we are here we are promised to have read some bytes beyond
-            // "front" so we may trim straight away.
-            //
-            rstate->trim_buf_before_ret();
-            return make_ready_future<tmp_buf_type>(std::move(rstate->buf));
-        });
-    });
-}
-
-template <typename CharType>
-future<temporary_buffer<CharType>>
-file::read_maybe_eof(uint64_t pos, size_t len, const io_priority_class& pc) {
-    //
-    // We have to allocate a new aligned buffer to make sure we don't get
-    // an EINVAL error due to unaligned destination buffer.
-    //
-    temporary_buffer<CharType> buf = temporary_buffer<CharType>::aligned(
-               memory_dma_alignment(), align_up(len, disk_read_dma_alignment()));
-
-    // try to read a single bulk from the given position
-    return dma_read(pos, buf.get_write(), buf.size(), pc).then_wrapped(
-            [buf = std::move(buf)](future<size_t> f) mutable {
-        try {
-            size_t size = std::get<0>(f.get());
-
-            buf.trim(size);
-
-            return std::move(buf);
-        } catch (std::system_error& e) {
-            //
-            // TODO: implement a non-trowing file_impl::dma_read() interface to
-            //       avoid the exceptions throwing in a good flow completely.
-            //       Otherwise for users that don't want to care about the
-            //       underlying file size and preventing the attempts to read
-            //       bytes beyond EOF there will always be at least one
-            //       exception throwing at the file end for files with unaligned
-            //       length.
-            //
-            if (e.code().value() == EINVAL) {
-                buf.trim(0);
-                return std::move(buf);
-            } else {
-                throw;
-            }
-        }
-    });
-}
-
 /// \endcond
 
 /// @}
+
+}
 
 #endif /* FILE_HH_ */

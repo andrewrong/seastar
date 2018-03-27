@@ -27,9 +27,16 @@
 #include <boost/any.hpp>
 #include <boost/type.hpp>
 #include <experimental/optional>
+#include <boost/variant.hpp>
 #include "core/timer.hh"
+#include "core/simple-stream.hh"
+#include "core/lowres_clock.hh"
+
+namespace seastar {
 
 namespace rpc {
+
+using rpc_clock_type = lowres_clock;
 
 // used to tag a type for serializers
 template<typename T>
@@ -112,11 +119,11 @@ public:
      using std::experimental::optional<T>::optional;
 };
 
-class opt_time_point : public std::experimental::optional<steady_clock_type::time_point> {
+class opt_time_point : public std::experimental::optional<rpc_clock_type::time_point> {
 public:
-     using std::experimental::optional<steady_clock_type::time_point>::optional;
-     opt_time_point(std::experimental::optional<steady_clock_type::time_point> time_point) {
-         static_cast<std::experimental::optional<steady_clock_type::time_point>&>(*this) = time_point;
+     using std::experimental::optional<rpc_clock_type::time_point>::optional;
+     opt_time_point(std::experimental::optional<rpc_clock_type::time_point> time_point) {
+         static_cast<std::experimental::optional<rpc_clock_type::time_point>&>(*this) = time_point;
      }
 };
 
@@ -156,13 +163,42 @@ struct cancellable {
     }
 };
 
+struct rcv_buf {
+    uint32_t size = 0;
+    boost::variant<std::vector<temporary_buffer<char>>, temporary_buffer<char>> bufs;
+    using iterator = std::vector<temporary_buffer<char>>::iterator;
+    rcv_buf() {}
+    explicit rcv_buf(size_t size_) : size(size_) {}
+};
+
+struct snd_buf {
+    static constexpr size_t chunk_size = 128*1024;
+    uint32_t size = 0;
+    boost::variant<std::vector<temporary_buffer<char>>, temporary_buffer<char>> bufs;
+    using iterator = std::vector<temporary_buffer<char>>::iterator;
+    snd_buf() {}
+    explicit snd_buf(size_t size_);
+    explicit snd_buf(temporary_buffer<char> b) : size(b.size()), bufs(std::move(b)) {};
+    temporary_buffer<char>& front();
+};
+
+static inline memory_input_stream<rcv_buf::iterator> make_deserializer_stream(rcv_buf& input) {
+    auto* b = boost::get<temporary_buffer<char>>(&input.bufs);
+    if (b) {
+        return memory_input_stream<rcv_buf::iterator>(memory_input_stream<rcv_buf::iterator>::simple(b->begin(), b->size()));
+    } else {
+        auto& ar = boost::get<std::vector<temporary_buffer<char>>>(input.bufs);
+        return memory_input_stream<rcv_buf::iterator>(memory_input_stream<rcv_buf::iterator>::fragmented(ar.begin(), input.size));
+    }
+}
+
 class compressor {
 public:
     virtual ~compressor() {}
     // compress data and leave head_space bytes at the beginning of returned buffer
-    virtual temporary_buffer<char> compress(size_t head_space, temporary_buffer<char> data) = 0;
+    virtual snd_buf compress(size_t head_space, snd_buf data) = 0;
     // decompress data
-    virtual temporary_buffer<char> decompress(temporary_buffer<char> data) = 0;
+    virtual rcv_buf decompress(rcv_buf data) = 0;
 
     // factory to create compressor for a connection
     class factory {
@@ -176,3 +212,6 @@ public:
 };
 
 } // namespace rpc
+
+}
+

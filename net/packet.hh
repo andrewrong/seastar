@@ -30,6 +30,9 @@
 #include <algorithm>
 #include <iosfwd>
 #include <experimental/optional>
+#include <functional>
+
+namespace seastar {
 
 namespace net {
 
@@ -124,7 +127,7 @@ class packet final {
             n->_rss_hash = old->_rss_hash;
             std::copy(old->_frags, old->_frags + old->_nr_frags, n->_frags);
             old->copy_internal_fragment_to(n.get());
-            return std::move(n);
+            return n;
         }
 
         static std::unique_ptr<impl> copy(impl* old) {
@@ -133,7 +136,7 @@ class packet final {
 
         static std::unique_ptr<impl> allocate_if_needed(std::unique_ptr<impl> old, size_t extra_frags) {
             if (old->_allocated_frags >= old->_nr_frags + extra_frags) {
-                return std::move(old);
+                return old;
             }
             return copy(old.get(), std::max<size_t>(old->_nr_frags + extra_frags, 2 * old->_nr_frags));
         }
@@ -213,6 +216,8 @@ public:
     packet(packet&& x, fragment frag, deleter d);
     // append temporary_buffer (zero-copy)
     packet(packet&& x, temporary_buffer<char> buf);
+    // create from temporary_buffer (zero-copy)
+    packet(temporary_buffer<char> buf);
     // append deleter
     packet(packet&& x, deleter d);
 
@@ -296,6 +301,12 @@ public:
             ret.push_back(std::move(frag));
         });
         return ret;
+    }
+    explicit operator bool() {
+        return bool(_impl);
+    }
+    static packet make_null_packet() {
+        return net::packet(nullptr);
     }
 private:
     void linearize(size_t at_frag, size_t desired_size);
@@ -381,7 +392,7 @@ inline
 packet::packet(Iterator begin, Iterator end, deleter del) {
     unsigned nr_frags = 0, len = 0;
     nr_frags = std::distance(begin, end);
-    std::for_each(begin, end, [&] (fragment& frag) { len += frag.size; });
+    std::for_each(begin, end, [&] (const fragment& frag) { len += frag.size; });
     _impl = impl::allocate(nr_frags);
     _impl->_deleter = std::move(del);
     _impl->_len = len;
@@ -465,6 +476,10 @@ inline
 packet::packet(packet&& x, temporary_buffer<char> buf)
     : packet(std::move(x), fragment{buf.get_write(), buf.size()}, buf.release()) {
 }
+
+inline
+packet::packet(temporary_buffer<char> buf)
+    : packet(fragment{buf.get_write(), buf.size()}, buf.release()) {}
 
 inline
 void packet::append(packet&& p) {
@@ -600,6 +615,8 @@ packet packet::share(size_t offset, size_t len) {
     assert(!n._impl->_deleter);
     n._impl->_deleter = _impl->_deleter.share();
     return n;
+}
+
 }
 
 }

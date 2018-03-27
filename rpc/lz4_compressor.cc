@@ -22,42 +22,72 @@
 #include "lz4_compressor.hh"
 #include "core/byteorder.hh"
 
+namespace seastar {
+
 namespace rpc {
 
 const sstring lz4_compressor::factory::_name = "LZ4";
 
-temporary_buffer<char> lz4_compressor::compress(size_t head_space, temporary_buffer<char> data) {
+
+static temporary_buffer<char> linearize(boost::variant<std::vector<temporary_buffer<char>>, temporary_buffer<char>>& v, uint32_t size) {
+    auto* one = boost::get<temporary_buffer<char>>(&v);
+    if (one) {
+        // no need to linearize
+        return std::move(*one);
+    } else {
+        temporary_buffer<char> src(size);
+        auto p = src.get_write();
+        for (auto&& b : boost::get<std::vector<temporary_buffer<char>>>(v)) {
+            p = std::copy_n(b.begin(), b.size(), p);
+        }
+        return src;
+    }
+}
+
+snd_buf lz4_compressor::compress(size_t head_space, snd_buf data) {
     head_space += 4;
-    temporary_buffer<char> dst(head_space + LZ4_compressBound(data.size()));
-    // Can't use LZ4_compress_default() since it's too new.
+    temporary_buffer<char> dst(head_space + LZ4_compressBound(data.size));
+    temporary_buffer<char> src = linearize(data.bufs, data.size);
+#ifdef HAVE_LZ4_COMPRESS_DEFAULT
+    auto size = LZ4_compress_default(src.begin(), dst.get_write() + head_space, src.size(), LZ4_compressBound(src.size()));
+#else
     // Safe since output buffer is sized properly.
-    auto size = LZ4_compress(data.begin(), dst.get_write() + head_space, data.size());
+    auto size = LZ4_compress(src.begin(), dst.get_write() + head_space, src.size());
+#endif
     if (size == 0) {
         throw std::runtime_error("RPC frame LZ4 compression failure");
     }
     dst.trim(size + head_space);
-    write_le<uint32_t>(dst.get_write() + 4, data.size());
-    return dst;
+    write_le<uint32_t>(dst.get_write() + (head_space - 4), data.size);
+    return snd_buf(std::move(dst));
 }
 
-temporary_buffer<char> lz4_compressor::decompress(temporary_buffer<char> data) {
-    if (data.size() < 4) {
-        return temporary_buffer<char>();
+rcv_buf lz4_compressor::decompress(rcv_buf data) {
+    if (data.size < 4) {
+        return rcv_buf();
     } else {
-        auto size = read_le<uint32_t>(data.begin());
+        auto in = make_deserializer_stream(data);
+        uint32_t v32;
+        in.read(reinterpret_cast<char*>(&v32), 4);
+        auto size = le_to_cpu(v32);
         if (size) {
-            temporary_buffer<char> dst(size);
-            if (LZ4_decompress_fast(data.begin() + 4, dst.get_write(), dst.size()) < 0) {
+            temporary_buffer<char> src = linearize(data.bufs, data.size);
+            src.trim_front(4);
+            rcv_buf rb(size);
+            rb.bufs = temporary_buffer<char>(size);
+            auto& dst = boost::get<temporary_buffer<char>>(rb.bufs);
+            if (LZ4_decompress_fast(src.begin(), dst.get_write(), dst.size()) < 0) {
                 throw std::runtime_error("RPC frame LZ4 decompression failure");
             }
-            return dst;
+            return rb;
         } else {
             // special case: if uncompressed size is zero it means that data was not compressed
             // compress side still not use this but we want to be ready for the future
-            data.trim_front(4);
-            return std::move(data);
+            return data;
         }
     }
+}
+
 }
 
 }

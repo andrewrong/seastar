@@ -27,69 +27,15 @@
 #include <cstring>
 #include "core/future.hh"
 #include "net/byteorder.hh"
+#include "net/socket_defs.hh"
 #include "net/packet.hh"
 #include "core/print.hh"
 #include "core/temporary_buffer.hh"
 #include "core/iostream.hh"
 #include <sys/types.h>
-#include <sys/socket.h>
-#include <netinet/ip.h>
 #include <boost/variant.hpp>
 
-struct ipv4_addr;
-
-class socket_address {
-public:
-    union {
-        ::sockaddr_storage sas;
-        ::sockaddr sa;
-        ::sockaddr_in in;
-    } u;
-    socket_address(sockaddr_in sa) {
-        u.in = sa;
-    }
-    socket_address(ipv4_addr);
-    socket_address() = default;
-    ::sockaddr& as_posix_sockaddr() { return u.sa; }
-    ::sockaddr_in& as_posix_sockaddr_in() { return u.in; }
-    const ::sockaddr& as_posix_sockaddr() const { return u.sa; }
-    const ::sockaddr_in& as_posix_sockaddr_in() const { return u.in; }
-};
-
 namespace seastar {
-
-enum class transport {
-    TCP = IPPROTO_TCP,
-    SCTP = IPPROTO_SCTP
-};
-
-}
-
-struct listen_options {
-    seastar::transport proto = seastar::transport::TCP;
-    bool reuse_address = false;
-    listen_options(bool rua = false)
-        : reuse_address(rua)
-    {}
-};
-
-struct ipv4_addr {
-    uint32_t ip;
-    uint16_t port;
-
-    ipv4_addr() : ip(0), port(0) {}
-    ipv4_addr(uint32_t ip, uint16_t port) : ip(ip), port(port) {}
-    ipv4_addr(uint16_t port) : ip(0), port(port) {}
-    ipv4_addr(const std::string &addr);
-    ipv4_addr(const std::string &addr, uint16_t port);
-
-    ipv4_addr(const socket_address &sa) {
-        ip = net::ntoh(sa.u.in.sin_addr.s_addr);
-        port = net::ntoh(sa.u.in.sin_port);
-    }
-
-    ipv4_addr(socket_address &&sa) : ipv4_addr(sa) {}
-};
 
 static inline
 bool is_ip_unspecified(ipv4_addr &addr) {
@@ -194,8 +140,6 @@ public:
 
 } /* namespace net */
 
-// TODO: remove from global NS
-
 /// \addtogroup networking-module
 /// @{
 
@@ -249,23 +193,18 @@ public:
     /// will immediately fail with an error.  This is useful to abort
     /// operations on a socket that is not making progress due to a
     /// peer failure.
-    future<> shutdown_output();
+    void shutdown_output();
     /// Disables input from the socket.
     ///
     /// Current or future reads will immediately fail with an error.
     /// This is useful to abort operations on a socket that is not making
     /// progress due to a peer failure.
-    future<> shutdown_input();
-    /// Disables socket input and output.
-    ///
-    /// Equivalent to \ref shutdown_input() and \ref shutdown_output().
+    void shutdown_input();
 };
 /// @}
 
 /// \addtogroup networking-module
 /// @{
-
-namespace seastar {
 
 /// The seastar socket.
 ///
@@ -282,20 +221,18 @@ public:
     /// Moves a \c seastar::socket object.
     socket(socket&&) noexcept;
     /// Move-assigns a \c seastar::socket object.
-    seastar::socket& operator=(seastar::socket&&) noexcept;
+    socket& operator=(socket&&) noexcept;
 
     /// Attempts to establish the connection.
     ///
     /// \return a \ref connected_socket representing the connection.
-    future<connected_socket> connect(socket_address sa, socket_address local = socket_address(::sockaddr_in{AF_INET, INADDR_ANY, {0}}), seastar::transport proto = seastar::transport::TCP);
+    future<connected_socket> connect(socket_address sa, socket_address local = socket_address(::sockaddr_in{AF_INET, INADDR_ANY, {0}}), transport proto = transport::TCP);
     /// Stops any in-flight connection attempt.
     ///
     /// Cancels the connection attempt if it's still in progress, and
     /// terminates the connection if it has already been established.
     void shutdown();
 };
-
-} /* namespace seastar */
 
 /// @}
 
@@ -305,6 +242,7 @@ public:
 /// A listening socket, waiting to accept incoming network connections.
 class server_socket {
     std::unique_ptr<net::server_socket_impl> _ssi;
+    bool _aborted = false;
 public:
     /// Constructs a \c server_socket not corresponding to a connection
     server_socket();
@@ -339,15 +277,17 @@ public:
     virtual ~network_stack() {}
     virtual server_socket listen(socket_address sa, listen_options opts) = 0;
     // FIXME: local parameter assumes ipv4 for now, fix when adding other AF
-    future<connected_socket> connect(socket_address sa, socket_address local = socket_address(::sockaddr_in{AF_INET, INADDR_ANY, {0}}), seastar::transport proto = seastar::transport::TCP) {
+    future<connected_socket> connect(socket_address sa, socket_address local = socket_address(::sockaddr_in{AF_INET, INADDR_ANY, {0}}), transport proto = transport::TCP) {
         return socket().connect(sa, local, proto);
     }
-    virtual seastar::socket socket() = 0;
+    virtual ::seastar::socket socket() = 0;
     virtual net::udp_channel make_udp_channel(ipv4_addr addr = {}) = 0;
     virtual future<> initialize() {
         return make_ready_future();
     }
     virtual bool has_per_core_namespace() = 0;
 };
+
+}
 
 #endif

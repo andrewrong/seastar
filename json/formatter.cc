@@ -23,9 +23,28 @@
 #include "json_elements.hh"
 #include <cmath>
 
+namespace seastar {
+
 using namespace std;
 
 namespace json {
+
+sstring formatter::begin(state s) {
+    switch (s) {
+    case state::array: return "[";
+    case state::map: return "{";
+    default: return {};
+    }
+}
+
+sstring formatter::end(state s) {
+    switch (s) {
+    case state::array: return "]";
+    case state::map: return "}";
+    default: return {};
+    }
+}
+
 
 sstring formatter::to_json(const sstring& str) {
     return to_json(str.c_str());
@@ -39,6 +58,10 @@ sstring formatter::to_json(const char* str) {
 }
 
 sstring formatter::to_json(int n) {
+    return to_string(n);
+}
+
+sstring formatter::to_json(unsigned n) {
     return to_string(n);
 }
 
@@ -82,6 +105,8 @@ sstring formatter::to_json(const jsonable& obj) {
 
 sstring formatter::to_json(unsigned long l) {
     return to_string(l);
+}
+
 }
 
 }

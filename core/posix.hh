@@ -16,7 +16,7 @@
  * under the License.
  */
 /*
- * Copyright (C) 2014 Cloudius Systems, Ltd.
+ * Copyright (C) 2016 ScyllaDB
  */
 
 #ifndef FILE_DESC_HH_
@@ -41,7 +41,21 @@
 #include <pthread.h>
 #include <signal.h>
 #include <memory>
-#include "net/api.hh"
+#include <chrono>
+#include <sys/uio.h>
+
+#include "net/socket_defs.hh"
+
+namespace seastar {
+
+/// \file
+/// \defgroup posix-support POSIX Support
+///
+/// Mostly-internal APIs to provide C++ glue for the underlying POSIX platform;
+/// but can be used by the application when they don't block.
+///
+/// \addtogroup posix-support
+/// @{
 
 inline void throw_system_error_on(bool condition, const char* what_arg = "");
 
@@ -306,6 +320,51 @@ private:
     file_desc(int fd) : _fd(fd) {}
  };
 
+
+namespace posix {
+
+/// Converts a duration value to a `timespec`
+///
+/// \param d a duration value to convert to the POSIX `timespec` format
+/// \return `d` as a `timespec` value
+template <typename Rep, typename Period>
+struct timespec
+to_timespec(std::chrono::duration<Rep, Period> d) {
+    auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(d).count();
+    struct timespec ts {};
+    ts.tv_sec = ns / 1000000000;
+    ts.tv_nsec = ns % 1000000000;
+    return ts;
+}
+
+/// Converts a relative start time and an interval to an `itimerspec`
+///
+/// \param base First expiration of the timer, relative to the current time
+/// \param interval period for re-arming the timer
+/// \return `base` and `interval` converted to an `itimerspec`
+template <typename Rep1, typename Period1, typename Rep2, typename Period2>
+struct itimerspec
+to_relative_itimerspec(std::chrono::duration<Rep1, Period1> base, std::chrono::duration<Rep2, Period2> interval) {
+    struct itimerspec its {};
+    its.it_interval = to_timespec(interval);
+    its.it_value = to_timespec(base);
+    return its;
+}
+
+
+/// Converts a time_point and a duration to an `itimerspec`
+///
+/// \param base  base time for the timer; must use the same clock as the timer
+/// \param interval period for re-arming the timer
+/// \return `base` and `interval` converted to an `itimerspec`
+template <typename Clock, class Duration, class Rep, class Period>
+struct itimerspec
+to_absolute_itimerspec(std::chrono::time_point<Clock, Duration> base, std::chrono::duration<Rep, Period> interval) {
+    return to_relative_itimerspec(base.time_since_epoch(), interval);
+}
+
+}
+
 class posix_thread {
 public:
     class attr;
@@ -362,6 +421,14 @@ void throw_kernel_error(T r) {
     }
 }
 
+template <typename T>
+inline
+void throw_pthread_error(T r) {
+    if (r != 0) {
+        throw std::system_error(r, std::system_category());
+    }
+}
+
 inline
 sigset_t make_sigset_mask(int signo) {
     sigset_t set;
@@ -384,6 +451,17 @@ sigset_t make_empty_sigset_mask() {
     return set;
 }
 
-void pin_this_thread(unsigned cpu_id);
+inline
+void pin_this_thread(unsigned cpu_id) {
+    cpu_set_t cs;
+    CPU_ZERO(&cs);
+    CPU_SET(cpu_id, &cs);
+    auto r = pthread_setaffinity_np(pthread_self(), sizeof(cs), &cs);
+    assert(r == 0);
+}
+
+/// @}
+
+}
 
 #endif /* FILE_DESC_HH_ */

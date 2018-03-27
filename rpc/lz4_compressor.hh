@@ -25,6 +25,8 @@
 #include "rpc/rpc_types.hh"
 #include <lz4.h>
 
+namespace seastar {
+
 namespace rpc {
     class lz4_compressor : public compressor {
     public:
@@ -41,8 +43,10 @@ namespace rpc {
     public:
         ~lz4_compressor() {}
         // compress data, leaving head_space empty in returned buffer
-        temporary_buffer<char> compress(size_t head_space, temporary_buffer<char> data) override;
+        snd_buf compress(size_t head_space, snd_buf data) override;
         // decompress data
-        temporary_buffer<char> decompress(temporary_buffer<char> data) override;
+        rcv_buf decompress(rcv_buf data) override;
     };
+}
+
 }

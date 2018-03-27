@@ -26,6 +26,8 @@
 #include <netinet/tcp.h>
 #include <netinet/sctp.h>
 
+namespace seastar {
+
 namespace net {
 
 using namespace seastar;
@@ -104,18 +106,23 @@ template <transport Transport>
 class posix_connected_socket_impl final : public connected_socket_impl, posix_connected_socket_operations<Transport> {
     lw_shared_ptr<pollable_fd> _fd;
     using _ops = posix_connected_socket_operations<Transport>;
+    conntrack::handle _handle;
 private:
     explicit posix_connected_socket_impl(lw_shared_ptr<pollable_fd> fd) : _fd(std::move(fd)) {}
+    explicit posix_connected_socket_impl(lw_shared_ptr<pollable_fd> fd, conntrack::handle&& handle)
+        : _fd(std::move(fd)), _handle(std::move(handle)) {}
 public:
-    virtual data_source source() override { return posix_data_source(*_fd); }
-    virtual data_sink sink() override { return posix_data_sink(*_fd); }
-    virtual future<> shutdown_input() override {
-        _fd->shutdown(SHUT_RD);
-        return make_ready_future<>();
+    virtual data_source source() override {
+        return data_source(std::make_unique< posix_data_source_impl>(_fd));
     }
-    virtual future<> shutdown_output() override {
+    virtual data_sink sink() override {
+        return data_sink(std::make_unique< posix_data_sink_impl>(_fd));
+    }
+    virtual void shutdown_input() override {
+        _fd->shutdown(SHUT_RD);
+    }
+    virtual void shutdown_output() override {
         _fd->shutdown(SHUT_WR);
-        return make_ready_future<>();
     }
     virtual void set_nodelay(bool nodelay) override {
         return _ops::set_nodelay(_fd->get_file_desc(), nodelay);
@@ -180,17 +187,16 @@ template <transport Transport>
 future<connected_socket, socket_address>
 posix_server_socket_impl<Transport>::accept() {
     return _lfd.accept().then([this] (pollable_fd fd, socket_address sa) {
-        static unsigned balance = 0;
-        auto cpu = balance++ % smp::count;
-
+        auto cth = _conntrack.get_handle();
+        auto cpu = cth.cpu();
         if (cpu == engine().cpu_id()) {
             std::unique_ptr<connected_socket_impl> csi(
-                    new posix_connected_socket_impl<Transport>(make_lw_shared(std::move(fd))));
+                    new posix_connected_socket_impl<Transport>(make_lw_shared(std::move(fd)), std::move(cth)));
             return make_ready_future<connected_socket, socket_address>(
                     connected_socket(std::move(csi)), sa);
         } else {
-            smp::submit_to(cpu, [this, fd = std::move(fd.get_file_desc()), sa] () mutable {
-                posix_ap_server_socket_impl<Transport>::move_connected_socket(_sa, pollable_fd(std::move(fd)), sa);
+            smp::submit_to(cpu, [ssa = _sa, fd = std::move(fd.get_file_desc()), sa, cth = std::move(cth)] () mutable {
+                posix_ap_server_socket_impl<Transport>::move_connected_socket(ssa, pollable_fd(std::move(fd)), sa, std::move(cth));
             });
             return accept();
         }
@@ -241,7 +247,7 @@ posix_ap_server_socket_impl<Transport>::abort_accept() {
 template <transport Transport>
 future<connected_socket, socket_address>
 posix_reuseport_server_socket_impl<Transport>::accept() {
-    return _lfd.accept().then([this] (pollable_fd fd, socket_address sa) {
+    return _lfd.accept().then([] (pollable_fd fd, socket_address sa) {
         std::unique_ptr<connected_socket_impl> csi(
                 new posix_connected_socket_impl<Transport>(make_lw_shared(std::move(fd))));
         return make_ready_future<connected_socket, socket_address>(
@@ -256,11 +262,12 @@ posix_reuseport_server_socket_impl<Transport>::abort_accept() {
 }
 
 template <transport Transport>
-void  posix_ap_server_socket_impl<Transport>::move_connected_socket(socket_address sa, pollable_fd fd, socket_address addr) {
+void
+posix_ap_server_socket_impl<Transport>::move_connected_socket(socket_address sa, pollable_fd fd, socket_address addr, conntrack::handle cth) {
     auto i = sockets.find(sa.as_posix_sockaddr_in());
     if (i != sockets.end()) {
         try {
-            std::unique_ptr<connected_socket_impl> csi(new posix_connected_socket_impl<Transport>(make_lw_shared(std::move(fd))));
+            std::unique_ptr<connected_socket_impl> csi(new posix_connected_socket_impl<Transport>(make_lw_shared(std::move(fd)), std::move(cth)));
             i->second.set_value(connected_socket(std::move(csi)), std::move(addr));
         } catch (...) {
             i->second.set_exception(std::current_exception());
@@ -271,13 +278,9 @@ void  posix_ap_server_socket_impl<Transport>::move_connected_socket(socket_addre
     }
 }
 
-data_source posix_data_source(pollable_fd& fd) {
-    return data_source(std::make_unique<posix_data_source_impl>(fd));
-}
-
 future<temporary_buffer<char>>
 posix_data_source_impl::get() {
-    return _fd.read_some(_buf.get_write(), _buf_size).then([this] (size_t size) {
+    return _fd->read_some(_buf.get_write(), _buf_size).then([this] (size_t size) {
         _buf.trim(size);
         auto ret = std::move(_buf);
         _buf = temporary_buffer<char>(_buf_size);
@@ -285,8 +288,9 @@ posix_data_source_impl::get() {
     });
 }
 
-data_sink posix_data_sink(pollable_fd& fd) {
-    return data_sink(std::make_unique<posix_data_sink_impl>(fd));
+future<> posix_data_source_impl::close() {
+    _fd->shutdown(SHUT_RD);
+    return make_ready_future<>();
 }
 
 std::vector<struct iovec> to_iovec(const packet& p) {
@@ -309,13 +313,19 @@ std::vector<iovec> to_iovec(std::vector<temporary_buffer<char>>& buf_vec) {
 
 future<>
 posix_data_sink_impl::put(temporary_buffer<char> buf) {
-    return _fd.write_all(buf.get(), buf.size()).then([d = buf.release()] {});
+    return _fd->write_all(buf.get(), buf.size()).then([d = buf.release()] {});
 }
 
 future<>
 posix_data_sink_impl::put(packet p) {
     _p = std::move(p);
-    return _fd.write_all(_p).then([this] { _p.reset(); });
+    return _fd->write_all(_p).then([this] { _p.reset(); });
+}
+
+future<>
+posix_data_sink_impl::close() {
+    _fd->shutdown(SHUT_WR);
+    return make_ready_future<>();
 }
 
 server_socket
@@ -404,7 +414,7 @@ private:
         void prepare(ipv4_addr dst, packet p) {
             _dst = make_ipv4_address(dst);
             _p = std::move(p);
-            _iovecs = std::move(to_iovec(_p));
+            _iovecs = to_iovec(_p);
             _hdr.msg_iov = _iovecs.data();
             _hdr.msg_iovlen = _iovecs.size();
         }
@@ -433,6 +443,8 @@ public:
     virtual future<> send(ipv4_addr dst, packet p);
     virtual void close() override {
         _closed = true;
+        _fd->abort_reader(std::make_exception_ptr(std::system_error(EPIPE, std::system_category())));
+        _fd->abort_writer(std::make_exception_ptr(std::system_error(EPIPE, std::system_category())));
         _fd.reset();
     }
     virtual bool is_closed() const override { return _closed; }
@@ -476,7 +488,12 @@ posix_udp_channel::receive() {
         auto dst = ipv4_addr(_recv._cmsg.pktinfo.ipi_addr.s_addr, _address.port);
         return make_ready_future<udp_datagram>(udp_datagram(std::make_unique<posix_datagram>(
             _recv._src_addr, dst, packet(fragment{_recv._buffer, size}, make_deleter([buf = _recv._buffer] { delete[] buf; })))));
+    }).handle_exception([p = _recv._buffer](auto ep) {
+        delete[] p;
+        return make_exception_future<udp_datagram>(std::move(ep));
     });
+}
+
 }
 
 }

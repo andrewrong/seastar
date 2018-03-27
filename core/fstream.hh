@@ -34,12 +34,27 @@
 #include "iostream.hh"
 #include "shared_ptr.hh"
 
+namespace seastar {
+
+class file_input_stream_history {
+    static constexpr uint64_t window_size = 4 * 1024 * 1024;
+    struct window {
+        uint64_t total_read = 0;
+        uint64_t unused_read = 0;
+    };
+    window current_window;
+    window previous_window;
+    unsigned read_ahead = 1;
+
+    friend class file_data_source_impl;
+};
 
 /// Data structure describing options for opening a file input stream
 struct file_input_stream_options {
     size_t buffer_size = 8192;    ///< I/O buffer size
-    unsigned read_ahead = 0;      ///< Number of extra read-ahead operations
-    ::io_priority_class io_priority_class = default_priority_class();
+    unsigned read_ahead = 0;      ///< Maximum number of extra read-ahead operations
+    ::seastar::io_priority_class io_priority_class = default_priority_class();
+    lw_shared_ptr<file_input_stream_history> dynamic_adjustments = { }; ///< Input stream history, if null dynamic adjustments are disabled
 };
 
 /// \brief Creates an input_stream to read a portion of a file.
@@ -70,7 +85,7 @@ struct file_output_stream_options {
     unsigned buffer_size = 8192;
     unsigned preallocation_size = 1024*1024; // 1MB
     unsigned write_behind = 1; ///< Number of buffers to write in parallel
-    ::io_priority_class io_priority_class = default_priority_class();
+    ::seastar::io_priority_class io_priority_class = default_priority_class();
 };
 
 // Create an output_stream for writing starting at the position zero of a
@@ -87,3 +102,4 @@ output_stream<char> make_file_output_stream(
         file file,
         file_output_stream_options options);
 
+}

@@ -27,6 +27,7 @@
 #include "core/semaphore.hh"
 #include "core/print.hh"
 #include "core/byteorder.hh"
+#include "core/metrics.hh"
 #include "net.hh"
 #include "ip_checksum.hh"
 #include "ip.hh"
@@ -44,6 +45,8 @@
 
 #define CRYPTOPP_ENABLE_NAMESPACE_WEAK 1
 #include <cryptopp/md5.h>
+
+namespace seastar {
 
 using namespace std::chrono_literals;
 
@@ -365,6 +368,7 @@ private:
             uint32_t partial_ack = 0;
             tcp_seq recover;
             bool window_probe = false;
+            uint8_t zero_window_probing_out = 0;
         } _snd;
         struct receive {
             tcp_seq next;
@@ -630,7 +634,7 @@ private:
     // queue for packets that do not belong to any tcb
     circular_buffer<ipv4_traits::l4packet> _packetq;
     semaphore _queue_space = {212992};
-    scollectd::registrations _collectd_regs;
+    metrics::metric_groups _metrics;
 public:
     class connection {
         lw_shared_ptr<tcb> _tcb;
@@ -729,19 +733,15 @@ private:
 template <typename InetTraits>
 tcp<InetTraits>::tcp(inet_type& inet)
     : _inet(inet)
-    , _e(_rd())
-    , _collectd_regs({
-        //
-        // Linearized events: DERIVE:0:u
-        //
-        scollectd::add_polled_metric(scollectd::type_instance_id(
-              "tcp"
-            , scollectd::per_cpu_plugin_instance
-            , "total_operations", "linearizations")
-            , scollectd::make_typed(scollectd::data_type::DERIVE
-            , [] { return tcp_packet_merger::linearizations(); })
-        ),
-    }) {
+    , _e(_rd()) {
+    namespace sm = metrics;
+
+    _metrics.add_group("tcp", {
+        sm::make_derive("linearizations", [] { return tcp_packet_merger::linearizations(); },
+                        sm::description("Counts a number of times a buffer linearization was invoked during the buffers merge process. "
+                                        "Divide it by a total TCP receive packet rate to get an everage number of lineraizations per TCP packet."))
+    });
+
     _inet.register_packet_provider([this, tcb_polled = 0u] () mutable {
         std::experimental::optional<typename InetTraits::l4packet> l4p;
         auto c = _poll_tcbs.size();
@@ -1270,6 +1270,7 @@ void tcp<InetTraits>::tcb::input_handle_other_state(tcp_hdr* th, packet p) {
             _snd.window = th->window << _snd.window_scale;
             _snd.wl1 = seg_seq;
             _snd.wl2 = seg_ack;
+            _snd.zero_window_probing_out = 0;
             if (_snd.window == 0) {
                 _persist_time_out = _rto;
                 start_persist_timer();
@@ -1280,6 +1281,8 @@ void tcp<InetTraits>::tcb::input_handle_other_state(tcp_hdr* th, packet p) {
         // ESTABLISHED STATE or
         // CLOSE_WAIT STATE: Do the same processing as for the ESTABLISHED state.
         if (in_state(ESTABLISHED | CLOSE_WAIT)){
+            // When we are in zero window probing phase and packets_out = 0 we bypass "duplicated ack" check
+            auto packets_out = _snd.next - _snd.unacknowledged - _snd.zero_window_probing_out;
             // If SND.UNA < SEG.ACK =< SND.NXT then, set SND.UNA <- SEG.ACK.
             if (_snd.unacknowledged < seg_ack && seg_ack <= _snd.next) {
                 // Remote ACKed data we sent
@@ -1346,7 +1349,7 @@ void tcp<InetTraits>::tcb::input_handle_other_state(tcp_hdr* th, packet p) {
                     exit_fast_recovery();
                     set_retransmit_timer();
                 }
-            } else if (!_snd.data.empty() && seg_len == 0 &&
+            } else if ((packets_out > 0) && !_snd.data.empty() && seg_len == 0 &&
                 th->f_fin == 0 && th->f_syn == 0 &&
                 th->ack == _snd.unacknowledged &&
                 uint32_t(th->window << _snd.window_scale) == _snd.window) {
@@ -1669,6 +1672,11 @@ void tcp<InetTraits>::tcb::output_one(bool data_retransmit) {
         }
     }
 
+
+    // if advertised TCP receive window is 0 we may only transmit zero window probing segment.
+    // Payload size of this segment is 1. Queueing anything bigger when _snd.window == 0 is bug
+    // and violation of RFC
+    assert((_snd.window > 0) || ((_snd.window == 0) && (len == 1)));
     queue_packet(std::move(p));
 }
 
@@ -1867,6 +1875,7 @@ void tcp<InetTraits>::tcb::persist() {
     tcp_debug("persist timer fired\n");
     // Send 1 byte packet to probe peer's window size
     _snd.window_probe = true;
+    _snd.zero_window_probing_out++;
     output_one();
     _snd.window_probe = false;
 
@@ -2033,10 +2042,11 @@ std::experimental::optional<typename InetTraits::l4packet> tcp<InetTraits>::tcb:
 
     auto p = std::move(_packetq.front());
     _packetq.pop_front();
-    if (!_packetq.empty() || (_snd.dupacks < 3 && can_send() > 0)) {
+    if (!_packetq.empty() || (_snd.dupacks < 3 && can_send() > 0 && (_snd.window > 0))) {
         // If there are packets to send in the queue or tcb is allowed to send
         // more add tcp back to polling set to keep sending. In addition, dupacks >= 3
         // is an indication that an segment is lost, stop sending more in this case.
+        // Finally - we can't send more until window is opened again.
         output();
     }
     return std::move(p);
@@ -2080,6 +2090,6 @@ typename tcp<InetTraits>::tcb::isn_secret tcp<InetTraits>::tcb::_isn_secret;
 
 }
 
-
+}
 
 #endif /* TCP_HH_ */
